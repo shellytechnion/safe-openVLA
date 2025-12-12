@@ -20,7 +20,8 @@ import numpy as np
 from tqdm import tqdm, trange
 
 import pandas as pd
-
+sys.path.append("/home/shellyfra/Projects/SAFE/openvla")
+sys.path.append("/home/shellyfra/Projects/SAFE/openvla/LIBERO")
 from libero.libero import benchmark
 
 
@@ -229,6 +230,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             logs_cum = defaultdict(float)
             pose_cumulator = PoseCumulator()
             hidden_states_episode = []
+            action_episode, probs_episode = [], []
             logs_to_dump = []
             
             while t < max_steps + cfg.num_steps_wait:
@@ -268,7 +270,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     )
                     
                     if type(actions) is tuple:
-                        actions, generated_outputs = actions
+                        actions, probs, generated_outputs = actions
                         
                     else:
                         generated_outputs = {} # empty dict
@@ -319,6 +321,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             to_be_logged[f"action/cum_{k}"] = np.sum(logs[k])
 
                         action = actions
+                    
+                    action_episode.append(action)
+                    probs_episode.append(probs)
                         
                         
                     # Log the action itself
@@ -411,9 +416,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
             if cfg.output_hidden_states:
                 hidden_states_episode = torch.stack(hidden_states_episode, dim=0) # (T, 7, 4096)
                 hidden_states_episode = hidden_states_episode
+                probs_episode = np.stack(probs_episode) # (T, 7)
+                probs_episode = probs_episode
+                action_episode = np.stack(action_episode) # (T, action_dim)
+                action_episode = action_episode
                 hidden_states_path = mp4_path.with_suffix(".pkl")
                 save_dict = {
                     "hidden_states": hidden_states_episode,
+                    "action": action_episode,
+                    "probs": probs_episode,
                     "task_suite_name": cfg.task_suite_name,
                     "task_id": task_id,
                     "task_description": task_description,

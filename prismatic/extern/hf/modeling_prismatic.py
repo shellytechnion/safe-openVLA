@@ -24,6 +24,7 @@ import tokenizers
 import torch
 import torch.nn as nn
 import transformers
+import torch.nn.functional as F
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
@@ -523,7 +524,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # print(input_ids.shape)
 
         # Run VLA inference
-        generated_outputs = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
+        generated_outputs = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), output_scores=True, **kwargs)
+        logits = generated_outputs.scores
+        new_logits = [F.softmax(logits[i], dim=1) for i in range(len(logits))]
+        probs = np.array([i.max().cpu().numpy() for i in new_logits])
+        
         generated_ids = generated_outputs['sequences']
 
         # Extract predicted action tokens and translate into (normalized) continuous actions
@@ -545,11 +550,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions,
         )
         
+        
         # If only one action was generated, return it as a 1D array
         if actions.shape[0] == 1:
             actions = actions[0]
 
-        return (actions, generated_outputs)
+        return (actions, probs, generated_outputs)
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
