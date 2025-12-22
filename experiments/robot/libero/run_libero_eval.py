@@ -18,6 +18,7 @@ import draccus
 import numpy as np
 # import tqdm
 from tqdm import tqdm, trange
+from scipy.special import softmax
 
 import pandas as pd
 sys.path.append("/home/shellyfra/Projects/SAFE/openvla")
@@ -230,7 +231,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             logs_cum = defaultdict(float)
             pose_cumulator = PoseCumulator()
             hidden_states_episode = []
-            action_episode, probs_episode = [], []
+            action_episode, probs_episode,  logits_episode = [], [], []
             logs_to_dump = []
             
             while t < max_steps + cfg.num_steps_wait:
@@ -324,7 +325,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     
                     action_episode.append(action)
                     probs_episode.append(probs)
-                        
+                    if isinstance(logits, tuple):
+                        logits_cpu = tuple(l.cpu().numpy() for l in logits)
+                    logits_probs = np.array([softmax(logits_cpu[i]) for i in range(len(logits_cpu))])
+                    probs_dof = logits_probs.squeeze(axis=1)
+                    sorted_probs = np.sort(probs_dof, axis=1)[..., ::-1]
+                    sorted_probs = sorted_probs[:, :10]
+                    logits_episode.append(sorted_probs)
+                    # print(f"Step {t}: action = {action}, probs = {probs}, logits top10 = {sorted_probs}")    
                         
                     # Log the action itself
                     dpos = np.linalg.norm(action[:3])
@@ -420,11 +428,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 probs_episode = probs_episode
                 action_episode = np.stack(action_episode) # (T, action_dim)
                 action_episode = action_episode
+                logits_episode = np.stack(logits_episode) # (T, 32,000 approx)
+                logits_episode = logits_episode
                 hidden_states_path = mp4_path.with_suffix(".pkl")
                 save_dict = {
                     "hidden_states": hidden_states_episode,
                     "action": action_episode,
                     "probs": probs_episode,
+                    "logits": logits_episode,
                     "task_suite_name": cfg.task_suite_name,
                     "task_id": task_id,
                     "task_description": task_description,
