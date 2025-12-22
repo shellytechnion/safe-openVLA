@@ -270,7 +270,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     )
                     
                     if type(actions) is tuple:
-                        actions, probs, generated_outputs = actions
+                        actions, probs, logits, generated_outputs = actions
                         
                     else:
                         generated_outputs = {} # empty dict

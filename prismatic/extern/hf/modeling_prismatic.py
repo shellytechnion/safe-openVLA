@@ -528,6 +528,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         logits = generated_outputs.scores
         new_logits = [F.softmax(logits[i], dim=1) for i in range(len(logits))]
         probs = np.array([i.max().cpu().numpy() for i in new_logits])
+
         
         generated_ids = generated_outputs['sequences']
 
@@ -555,7 +556,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         if actions.shape[0] == 1:
             actions = actions[0]
 
-        return (actions, probs, generated_outputs)
+        return (actions, probs, logits, generated_outputs)
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:

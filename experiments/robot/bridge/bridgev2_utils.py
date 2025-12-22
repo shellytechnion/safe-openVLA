@@ -17,7 +17,7 @@ from experiments.robot.bridge.widowx_env import WidowXGym
 ACTION_DIM = 7
 BRIDGE_PROPRIO_DIM = 7
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 np.set_printoptions(formatter={"float": lambda x: "{0:0.2f}".format(x)})
 
 
