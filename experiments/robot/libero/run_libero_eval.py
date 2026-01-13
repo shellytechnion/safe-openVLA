@@ -94,7 +94,7 @@ class GenerateConfig:
 
     use_wandb: bool = True                           # Whether to also log results in Weights & Biases
     wandb_project: str = "openvla"                   # Name of W&B project to log to (use default!)
-    wandb_entity: str = "qiaog"                      # Name of entity to log under
+    wandb_entity: str = "shellyfra"                  # Name of entity to log under
     wandb_dir: Optional[str] = None                  # Directory to save W&B logs
     save_logs: bool = True                          # Whether to dump W&B logs to a file
 
