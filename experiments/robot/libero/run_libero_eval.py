@@ -12,6 +12,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 import torch
+import torch.nn.functional as F
 import wandb
 
 import draccus
@@ -326,10 +327,20 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     action_episode.append(action)
                     probs_episode.append(probs)
                     if isinstance(logits, tuple):
-                        logits_cpu = tuple(l.cpu().numpy() for l in logits)
-                    logits_probs = np.array([softmax(logits_cpu[i]) for i in range(len(logits_cpu))])
-                    probs_dof = logits_probs.squeeze(axis=1)
-                    sorted_probs = np.sort(probs_dof, axis=1)[..., ::-1]
+                        vocab_size = model.config.text_config.vocab_size - model.config.pad_to_multiple_of
+                        n_action_bins = model.config.n_action_bins
+                        
+                        # For PROBS: slice to action bins and apply softmax (matches CSV computation)
+                        # Use bfloat16 for softmax to match data collection precision
+                        logits = torch.stack(logits, axis=0)
+                        action_logits = logits[:, 0, vocab_size - n_action_bins + 1 : vocab_size + 1]  # (7, 256)
+                        token_prob = F.softmax(action_logits, dim=-1)  # (7, 256) - keep in bfloat16
+                        # probs = token_prob.max(dim=-1).values.float().cpu().numpy()  # (7,)
+
+                    #     logits_cpu = tuple(l.cpu().numpy() for l in logits)
+                    # logits_probs = np.array([softmax(logits_cpu[i]) for i in range(len(logits_cpu))])
+                    # probs_dof = logits_probs.squeeze(axis=1)
+                    sorted_probs = np.sort(token_prob.cpu().numpy(), axis=1)[..., ::-1]
                     sorted_probs = sorted_probs[:, :10]
                     logits_episode.append(sorted_probs)
                     # print(f"Step {t}: action = {action}, probs = {probs}, logits top10 = {sorted_probs}")    
