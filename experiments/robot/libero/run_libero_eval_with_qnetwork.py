@@ -26,9 +26,12 @@ import cv2
 
 import pandas as pd
 
-sys.path.append("/home/shellyfra/Projects/SAFE/openvla")
-sys.path.append("/home/shellyfra/Projects/SAFE/openvla/LIBERO")
-sys.path.append("/home/shellyfra/Projects/SAFE")
+script_dir = Path(__file__).parent
+openvla_root = script_dir.parent.parent.parent
+repo_root = openvla_root.parent
+sys.path.append(str(openvla_root))
+sys.path.append(str(openvla_root / "LIBERO"))
+sys.path.append(str(repo_root))
 
 from libero.libero import benchmark
 
@@ -50,7 +53,6 @@ from experiments.robot.robot_utils import (
     get_model,
     invert_gripper_action,
     normalize_gripper_action,
-    set_seed_everywhere,
 )
 from experiments.robot.viz_utils import (
     PoseCumulator
@@ -63,7 +65,7 @@ from experiments.robot.unc_utils import (
 # Import Q-Network
 from failure_prob.model.q_learning import GRUQNetwork, CategoricalGRUQNetwork
 from failure_prob.conf import Config as OpenvlaDatasetConfig
-from failure_prob.utils.metrics import compute_functional_conformal_band
+from failure_prob.utils.metrics import compute_functional_conformal_band, eval_functional_conformal
 from failure_prob.utils.routines import model_forward_dataloader
 from failure_prob.data.utils import Rollout, RolloutDataset, RolloutDatasetContinuous, ConsecutiveSampler
 from failure_prob.data import load_rollouts, split_rollouts
@@ -92,21 +94,25 @@ class GenerateConfig:
     output_logits: bool = True                       # Whether to output logits from the model
     output_attentions: bool = False                  # Whether to output attention weights from the model
     output_hidden_states: bool = False               # Whether to output hidden states from the model
+    
+    temperature: float = 1.5                         # Temperature for action sampling in CP-guided selection
+    n_action_candidates: int = 5                    # Number of action candidates to sample for CP-guided selection
+    use_cp_guided_selection: bool = True             # Whether to use CP-guided action selection
 
     #################################################################################################################
     # Q-Network specific parameters
     #################################################################################################################
-    qnetwork_checkpoint: str = "/home/shellyfra/Projects/SAFE/checkpoints/model_final_TDQC_OpenVLA_LIBERO10.ckpt"  # Path to trained Q-network checkpoint
-    qnetwork_config_path: str = "/home/shellyfra/Projects/SAFE/checkpoints/config.yaml"      # Path to Q-network config file
+    qnetwork_checkpoint: str = "./checkpoints/model_final_TDQC_OpenVLA_LIBERO10.ckpt"  # Path to trained Q-network checkpoint
+    qnetwork_config_path: str = "./checkpoints/config_TDQC_OpenVLA_LIBERO10.yaml"      # Path to Q-network config file
     conformal_threshold: float = 0.5                 # Conformal prediction threshold for stopping
     use_categorical: bool = False                    # Whether to use categorical Q-network
     
     #################################################################################################################
     # Conformal Prediction parameters
     #################################################################################################################
-    use_conformal_prediction: bool = True            # Whether to use conformal prediction
+    use_conformal_prediction: bool = False            # Whether to use conformal prediction
     conformal_alpha: float = 0.2                     # Miscoverage rate for conformal prediction (e.g., 0.1 for 90% coverage)
-    calibration_data_path: str = "/home/shellyfra/Projects/SAFE/openvla/rollouts/single-foward/libero_10/"  # Path to rollouts for CP calibration
+    calibration_data_path: str = "./openvla/rollouts/single-foward/libero_10/"  # Path to rollouts for CP calibration
     calibration_seed: int = 20                        # Seed for train/test split (0 means tasks 0,3,5 for test)
     test_task_ids: Optional[List[int]] = None        # Specific task IDs to evaluate (default: [0, 3, 5])
     
@@ -125,11 +131,11 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = "qnetwork_eval"     # Extra note to add in run ID for logging
     save_root: str = "./rollouts_qnetwork"           # Root directory to save rollouts
-    save_videos: bool = True                         # Whether to save videos with Q-values and CP bands
+    save_videos: bool = False                         # Whether to save videos with Q-values and CP bands
 
     use_wandb: bool = False                           # Whether to also log results in Weights & Biases
     wandb_project: str = "openvla-qnetwork"          # Name of W&B project to log to
-    wandb_entity: str = "shellyfra"                  # Name of entity to log under
+    wandb_entity: str = "anonymous"                  # Name of entity to log under
     wandb_dir: Optional[str] = None                  # Directory to save W&B logs
     save_logs: bool = True                           # Whether to dump W&B logs to a file
     seed: int = 7                                    # Random seed
@@ -197,10 +203,11 @@ def prepare_qnetwork_input(
         top_k_probs = token_probs
     
     # Prepare batch (add batch and time dimensions)
+    # IMPORTANT: Cast to float32 to match training data dtype
     batch = {
-        "top_10_probs": top_k_probs.unsqueeze(0).unsqueeze(0).to(device),  # (1, 1, 7, 10)
+        "top_10_probs": top_k_probs.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32),  # (1, 1, 7, 10)
         "action_vectors": torch.from_numpy(action).float().unsqueeze(0).unsqueeze(0).to(device),  # (1, 1, 7)
-        "done_masks": torch.ones(1, 1, 1).to(device),  # (1, 1, 1)
+        "done_masks": torch.ones(1, 1, 1, dtype=torch.float32, device=device),  # (1, 1, 1)
     }
     
     return batch
@@ -210,25 +217,29 @@ def compute_q_value(
     qnetwork,
     batch: dict,
     hidden_state: Optional[torch.Tensor] = None,
-    use_categorical: bool = False
+    use_categorical: bool = False, 
 ) -> tuple[float, torch.Tensor]:
     """
-    Compute Q-value for current step.
+    Compute Q-value for current step using manual GRU processing.
+    Bypasses the forward() method to avoid train/test mode complications.
     
     Args:
         qnetwork: Q-network model
-        batch: Input batch
-        hidden_state: Hidden state from previous step (num_layers, batch_size, hidden_size)
+        batch: Input batch with single timestep (B=1, T=1)
+        hidden_state: Hidden state from previous step (num_layers, hidden_size)
         use_categorical: Whether using categorical Q-network
         
     Returns:
         (q_value, new_hidden_state)
     """
-    with torch.no_grad():
-        # Process through input projection and get GRU input
+
+    with torch.inference_mode():
+        # Ensure model is in eval mode for consistent LayerNorm and other layers
+        qnetwork.eval()
+        
+        # Extract and process input
         actions = batch["action_vectors"]
         
-        # Prepare input (same as in forward pass)
         if "top_10_probs" in batch:
             top_k_probs = batch["top_10_probs"]
             B, T, action_dim, k = top_k_probs.shape
@@ -241,32 +252,266 @@ def compute_q_value(
         else:
             x = probs
         
-        x = qnetwork.input_proj(x)  # (B, T, hidden_size) = (1, 1, hidden_size)
-        x = x.squeeze(0)  # (T, hidden_size) = (1, hidden_size)
+        # Project input: (1, 1, input_dim) -> (1, 1, hidden_size)
+        x = qnetwork.input_proj(x)
         
-        # Initialize hidden state if not provided (2D for GRU input compatibility)
+        # Reshape for GRU in unbatched mode: (1, 1, hidden_size) -> (1, hidden_size)
+        # This matches the test mode: x[i:i+1, j:j+1, :].squeeze(0)
+        x = x.squeeze(0).squeeze(0)  # Remove batch and time dims -> (hidden_size,)
+        x = x.unsqueeze(0)  # Add seq_len dim -> (1, hidden_size)
+        
+        # Initialize hidden state if needed (num_layers, hidden_size) for unbatched mode
         if hidden_state is None:
             num_layers = qnetwork.gru.num_layers
             hidden_size = qnetwork.gru.hidden_size
             hidden_state = torch.zeros(num_layers, hidden_size, dtype=x.dtype, device=x.device)
         
-        # Run through GRU with 2D input (T, hidden_size) and 2D hidden state (num_layers, hidden_size)
+        # Pass through GRU in unbatched mode: 
+        # Input: (seq_len=1, hidden_size)
+        # Hidden: (num_layers, hidden_size)
+        # Output: (seq_len=1, hidden_size), (num_layers, hidden_size)
         gru_out, new_hidden_state = qnetwork.gru(x, hidden_state)
         
         # Get Q-value from head
-        if use_categorical:
-            # Categorical: get logits then probabilities
-            logits = qnetwork.head(gru_out)
-            probs = torch.softmax(logits, dim=-1)
-            q_value = (probs * qnetwork.support.view(1, -1)).sum(dim=-1)
-            q_val_scalar = (1 - q_value.squeeze()).item()  # Convert to failure score
-        else:
-            # Standard: get Q-value directly
-            logits = qnetwork.head(gru_out)
-            q = torch.sigmoid(logits)
-            q_val_scalar = (1 - q.squeeze()).item()  # Score (higher = more failure)
+        # gru_out shape: (1, hidden_size)
+        logits = qnetwork.head(gru_out)  # (1, 1)
+        q_value = torch.sigmoid(logits)
+        q_val_scalar = (1 - q_value.squeeze()).item()  # Convert to failure score
         
     return q_val_scalar, new_hidden_state
+
+
+def cp_guided_action_selection(
+    cfg: GenerateConfig,
+    model,
+    processor,
+    observation: dict,
+    task_description: str,
+    qnetwork,
+    hidden_state: torch.Tensor,
+    device: torch.device,
+    step_idx: int,
+    cp_threshold: Optional[float] = None,
+    use_categorical: bool = False,
+    env = None,
+    resize_size: tuple = None,
+) -> Tuple[np.ndarray, float, torch.Tensor, dict]:
+    """
+    Sample multiple actions and select the safest one according to Q-network.
+    
+    Args:
+        cfg: Configuration
+        model: OpenVLA model
+        processor: Processor for observations
+        observation: Current observation dict
+        task_description: Task description string
+        qnetwork: Q-network model
+        hidden_state: Current hidden state
+        device: Device
+        step_idx: Current step index
+        cp_threshold: Optional CP threshold for filtering
+        use_categorical: Whether using categorical Q-network
+        
+    Returns:
+        (selected_action, q_value, updated_hidden_state, result_dict)
+    """
+    n_candidates = cfg.n_action_candidates
+    
+    # Sample multiple actions with temperature
+    result = get_action(
+        cfg,
+        model,
+        observation,
+        task_description,
+        processor=processor,
+        n_samples=n_candidates,
+        do_sample=True,
+        temperature=cfg.temperature,
+    )
+    
+    if type(result) is tuple:
+        actions, probs, logits, generated_outputs = result
+    else:
+        actions = result
+        logits = None
+    
+    # Normalize actions
+    actions = normalize_gripper_action(actions, binarize=True)
+    if cfg.model_family == "openvla":
+        actions = invert_gripper_action(actions)
+    
+    # Get unique actions to reduce redundant evaluations
+    unique_actions = np.unique(actions, axis=0)
+    print(f"        Evaluating {len(unique_actions)} unique actions out of {len(actions)} samples")
+    
+    # Save current environment state for rollouts
+    if env is not None:
+        initial_state = env.sim.get_state()
+    
+    # Evaluate each unique action with 1-step lookahead
+    q_values = []
+    hidden_states = []
+    lookahead_actions = []
+    
+    for i in range(len(unique_actions)):
+        action = unique_actions[i]
+        
+        if env is not None and resize_size is not None:
+            # Restore environment to initial state
+            env.sim.set_state(initial_state)
+            env.sim.forward()
+            
+            # Execute candidate action
+            try:
+                next_obs, reward, done, info = env.step(action)
+            except ValueError as e:
+                if "terminated episode" in str(e):
+                    print(f"        Warning: Action {i} caused termination, skipping")
+                    q_value = 1.0
+                    q_values.append(q_value)
+                    hidden_states.append(hidden_state.clone() if hidden_state is not None else None)
+                    lookahead_actions.append(action)
+                    continue
+                else:
+                    raise
+            
+            # Get next observation for VLA
+            next_img = get_libero_image(next_obs, resize_size)
+            next_observation = {
+                "full_image": next_img,
+                "state": np.concatenate(
+                    (next_obs["robot0_eef_pos"], quat2axisangle(next_obs["robot0_eef_quat"]), next_obs["robot0_gripper_qpos"])
+                ),
+            }
+            
+            # Query VLA for next action and probabilities
+            next_result = get_action(
+                cfg,
+                model,
+                next_observation,
+                task_description,
+                processor=processor,
+                n_samples=1,
+                do_sample=False,
+            )
+            
+            if type(next_result) is tuple:
+                next_actions, _, next_logits, next_gen_outputs = next_result
+            else:
+                next_actions = next_result
+                next_logits = None
+            
+            # Process next action
+            next_actions = normalize_gripper_action(next_actions, binarize=True)
+            if cfg.model_family == "openvla":
+                next_actions = invert_gripper_action(next_actions)
+            next_action = next_actions[0] if next_actions.ndim > 1 else next_actions
+            lookahead_actions.append(next_action)
+            
+            # Get probabilities for next action
+            if isinstance(next_logits, tuple):
+                predicted_token_ids = next_gen_outputs['sequences'][0, -model.get_action_dim(cfg.unnorm_key):].cpu().numpy()
+                
+                all_probs = []
+                for dof in range(len(next_logits)):
+                    logits_dof = next_logits[dof][0].cpu().numpy()  # (vocab_size,)
+                    probs_dof = softmax(logits_dof)  # (vocab_size,)
+                    all_probs.append(probs_dof)
+                
+                all_probs = np.array(all_probs)  # (7, vocab_size)
+                sorted_probs = np.sort(all_probs, axis=1)[..., ::-1]  # Sort descending
+                top_10_probs = sorted_probs[:, :10]  # (7, 10)
+                top_10_probs = torch.from_numpy(top_10_probs.copy()).to(device=device, dtype=torch.float32)
+            else:
+                top_10_probs = torch.ones(7, 10, device=device) * 0.1
+        else:
+            # Fallback: use current action's probabilities if no env provided
+            # Find corresponding index in original actions
+            action_idx = np.where((actions == action).all(axis=1))[0][0]
+            
+            if isinstance(logits, tuple):
+                predicted_token_ids = generated_outputs['sequences'][action_idx, -model.get_action_dim(cfg.unnorm_key):].cpu().numpy()
+                
+                all_probs = []
+                for dof in range(len(logits)):
+                    logits_dof = logits[dof][action_idx].cpu().numpy()  # (vocab_size,)
+                    probs_dof = softmax(logits_dof)  # (vocab_size,)
+                    all_probs.append(probs_dof)
+                
+                all_probs = np.array(all_probs)  # (7, vocab_size)
+                sorted_probs = np.sort(all_probs, axis=1)[..., ::-1]  # Sort descending
+                top_10_probs = sorted_probs[:, :10]  # (7, 10)
+                top_10_probs = torch.from_numpy(top_10_probs.copy()).to(device=device, dtype=torch.float32)
+            else:
+                top_10_probs = torch.ones(7, 10, device=device) * 0.1
+            lookahead_actions.append(action)
+        
+        # Evaluate action with Q-network
+        qnet_batch = prepare_qnetwork_input(
+            lookahead_actions[-1] if env is not None else action,
+            top_10_probs,
+            step_idx,
+            device
+        )
+        
+        # Compute Q-value (clone hidden state to avoid modifying original)
+        q_value, new_hidden = compute_q_value(
+            qnetwork,
+            qnet_batch,
+            hidden_state=hidden_state.clone() if hidden_state is not None else None,
+            use_categorical=use_categorical
+        )
+        
+        q_values.append(q_value)
+        hidden_states.append(new_hidden)
+    
+    # Restore environment to original state
+    if env is not None:
+        env.sim.set_state(initial_state)
+        env.sim.forward()
+    
+    # Select action with lowest failure probability (from unique actions)
+    safest_idx = np.argmin(q_values)
+    selected_action = unique_actions[safest_idx]
+    selected_q_value = q_values[safest_idx]
+    selected_hidden_state = hidden_states[safest_idx]
+    
+    # Build result dict with selected action's info
+    # For probabilities, compute from the selected action
+    if isinstance(logits, tuple):
+        # Find corresponding index in original sampled actions
+        orig_action_idx = np.where((actions == selected_action).all(axis=1))[0][0]
+        selected_token_ids = generated_outputs['sequences'][orig_action_idx, -model.get_action_dim(cfg.unnorm_key):].cpu().numpy()
+        
+        # Get probabilities for the selected tokens (the actual predicted tokens)
+        selected_top_10_probs_list = []
+        for dof in range(len(logits)):
+            logits_dof = logits[dof][orig_action_idx].cpu().numpy()  # (vocab_size,)
+            probs_dof = softmax(logits_dof)  # (vocab_size,)
+            
+            # Get top-10 indices (will include the selected token if it's in top-10)
+            top_10_indices = np.argsort(probs_dof)[::-1][:10]
+            top_10_probs_dof = probs_dof[top_10_indices]  # (10,)
+            
+            selected_top_10_probs_list.append(top_10_probs_dof)
+        
+        # Stack to (7, 10)
+        selected_top_10_probs = np.array(selected_top_10_probs_list)
+        selected_top_10_probs = torch.from_numpy(selected_top_10_probs.copy()).to(device=device, dtype=torch.float32)
+    else:
+        selected_top_10_probs = torch.ones(7, 10, device=device) * 0.1
+    
+    result_dict = {
+        'top_10_probs': selected_top_10_probs,
+        'all_q_values': q_values,
+        'safest_idx': safest_idx,
+        'q_value_range': (min(q_values), max(q_values)),
+        'n_unique_actions': len(unique_actions),
+    }
+    
+    print(f"        CP-guided selection with 1-step lookahead: Q-values range [{min(q_values):.4f}, {max(q_values):.4f}], selected #{safest_idx}/{len(unique_actions)} with Q={selected_q_value:.4f}")
+    
+    return selected_action, selected_q_value, selected_hidden_state, result_dict
 
 
 def recovery_sampling(
@@ -277,12 +522,8 @@ def recovery_sampling(
     env,
     task_description: str,
     resize_size: tuple,
-    vocab_size: int,
-    n_action_bins: int,
-    device: torch.device,
-    num_recovery_steps: int = 20,
-    prev_action=None,
-    initial_state=None
+    num_recovery_steps: int = 520,
+    initial_state=None,
 ) -> Tuple[bool, int, Any, float, List[np.ndarray], bool]:
     """
     Execute recovery by sampling 10 actions and trying each one for 20 steps.
@@ -300,136 +541,85 @@ def recovery_sampling(
         device: Device
         num_recovery_steps: Number of recovery steps for each action trial
         prev_action: Action that triggered CP violation
-        initial_state: Environment state to reset to for each trial
+        current_state: Current environment state (flattened) at CP violation
         
     Returns:
         (done, steps_taken, final_obs, final_reward, recovery_frames, recovery_succeeded)
     """
     print(f"    Starting recovery: sampling 10 actions, trying each for {num_recovery_steps} steps")
     
-    # Get observation and sample 10 actions
-    img = get_libero_image(obs, resize_size)
-    observation = {
-        "full_image": img,
-        "state": np.concatenate(
-            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-        ),
-    }
-    
-    # Clear GPU cache before sampling
-    torch.cuda.empty_cache()
-    
-    # Sample 10 actions
-    result = get_action(
-        cfg,
-        model,
-        observation,
-        task_description,
-        processor=processor,
-        n_samples=10,
-    )
-    
-    if type(result) is not tuple:
-        print("      No tuple result from get_action, skipping recovery")
-        return False, 0, obs, 0, [], False
-    
-    actions, _, _, _ = result
-    
-    # Remove prev_action from sampling pool
-    available_indices = list(range(actions.shape[0]) if actions.ndim > 1 else [0])
-    if prev_action is not None and actions.ndim > 1:
-        for idx in range(actions.shape[0]):
-            if np.allclose(actions[idx], prev_action, atol=1e-3):
-                available_indices.remove(idx)
-                print(f"      Removed index {idx} (matches prev_action) from sampling pool")
-                break
-    
-    print(f"      Trying {len(available_indices)} sampled actions")
-    
-    # Try each sampled action
+    recovery_prompt = f"ATTENTION: {task_description}. Previous attempt failed. Try a different approach."
+    # recovery_prompt = f'ATTENTION: execute {task_description}. Do it slow and safe.'
+
     best_result = None
     best_reward = -float('inf')
     
-    for trial_idx, action_idx in enumerate(available_indices):
-        print(f"      Trial {trial_idx + 1}/{len(available_indices)}: testing action {action_idx}")
+    trial_frames = []
+    trial_done = False
+    trial_reward = 0
+    torch.cuda.empty_cache()
+    env.reset()
+    obs = env.set_init_state(initial_state)
+    for step in range(num_recovery_steps): # - len(actions_history)
+        # Wait for objects to stabilize
+        if step < cfg.num_steps_wait:
+            obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
+            continue
+        img = get_libero_image(obs, resize_size)
+        observation = {
+            "full_image": img,
+            "state": np.concatenate(
+                (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+            ),
+        }
+            
+        torch.cuda.empty_cache()
+        result = get_action(
+            cfg,
+            model,
+            observation,
+            recovery_prompt,
+            processor=processor,
+            n_samples=1,
+            do_sample=False,
+        )
+        if type(result) is tuple:
+            action = result[0][0] if result[0].ndim > 1 else result[0]
+        else:
+            action = result
         
-        # Reset to initial state
-        if initial_state is not None:
-            env.reset()
-            obs = env.set_init_state(initial_state)
+        action_norm = normalize_gripper_action(action, binarize=True)
+        if cfg.model_family == "openvla":
+            action_norm = invert_gripper_action(action_norm)
         
-        # Get the action to try
-        trial_action = actions[action_idx] if actions.ndim > 1 else actions
+        obs, reward, done, info = env.step(action_norm)
+        if step % 10 == 0 or done:
+            print(f"        Step {step}: Done: {done}")
         
-        # Execute this action for num_recovery_steps
-        trial_frames = []
-        trial_done = False
-        trial_reward = 0
+        if "agentview_image" in obs:
+            trial_frames.append(obs["agentview_image"])
         
-        for step in range(num_recovery_steps):
-            # Get current observation
-            img = get_libero_image(obs, resize_size)
-            observation = {
-                "full_image": img,
-                "state": np.concatenate(
-                    (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-                ),
-            }
-            
-            # For first step, use the sampled action; after that use argmax (n_samples=1)
-            if step == 0:
-                action = trial_action
-            else:
-                torch.cuda.empty_cache()
-                result = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    n_samples=1,
-                )
-                if type(result) is tuple:
-                    action = result[0][0] if result[0].ndim > 1 else result[0]
-                else:
-                    action = result
-            
-            # Normalize and execute action
-            action_norm = normalize_gripper_action(action, binarize=True)
-            if cfg.model_family == "openvla":
-                action_norm = invert_gripper_action(action_norm)
-            
-            obs, reward, done, info = env.step(action_norm)
-            
-            # Store frame
-            if "agentview_image" in obs:
-                trial_frames.append(obs["agentview_image"])
-            
-            if done:
-                trial_done = True
-                trial_reward = reward
-                success = reward > 0
-                print(f"        Episode finished at step {step + 1}: {'SUCCESS' if success else 'FAILURE'}")
-                break
+        if done:
+            trial_done = True
+            trial_reward = reward
+            success = reward > 0
+            print(f"        Episode finished at step {step + 1}: {'SUCCESS' if success else 'FAILURE'}")
+            break
         
-        # Check if this trial is the best so far
-        if trial_done and trial_reward > best_reward:
-            best_reward = trial_reward
-            best_result = (trial_done, len(trial_frames), obs, trial_reward, trial_frames, trial_reward > 0)
-            
-            # If we found a success, stop trying other actions
-            if trial_reward > 0:
-                print(f"      Found successful recovery with action {action_idx}!")
-                return best_result
+    if trial_done and trial_reward > best_reward:
+        best_reward = trial_reward
+        best_result = (trial_done, len(trial_frames), obs, trial_reward, trial_frames, trial_reward > 0)
+        
+    if trial_reward > 0:
+        print(f"      Found successful recovery with action !")
+        return best_result
     
-    # If we found any completion (even failure), return it
     if best_result is not None:
         print(f"      Best trial completed with reward {best_reward}")
         return best_result
     
-    # No trial completed - return last state
     print(f"      No trial completed within {num_recovery_steps} steps")
-    return False, num_recovery_steps, obs, 0, [], False
+    return False, num_recovery_steps, obs, 0, trial_frames, False
 
 
 def save_video_with_scores(
@@ -561,7 +751,10 @@ def calibrate_conformal_prediction(
     qnetwork,
     val_seen_dataloader: DataLoader,
     device: torch.device,
-) -> np.ndarray:
+    rollouts_by_split_name: dict = None,
+    calib_split_names: list = ["val_seen"],
+    test_split_names: list = ["val_unseen"],
+) -> Tuple[np.ndarray, pd.DataFrame, dict]:
     """
     Calibrate conformal prediction bands using val_seen data.
     
@@ -570,9 +763,14 @@ def calibrate_conformal_prediction(
         qnetwork: Q-network model
         val_seen_dataloader: DataLoader for val_seen rollouts
         device: Device
+        rollouts_by_split_name: Dictionary mapping split names to rollouts (optional)
+        calib_split_names: List of calibration split names
+        test_split_names: List of test split names
         
     Returns:
         cp_band: Conformal prediction band (T,) - threshold at each timestep
+        df: DataFrame with evaluation metrics
+        cp_bands_by_alpha: Dictionary mapping alpha values to CP bands
     """
     print(f"\nCalibrating conformal prediction with alpha={cfg.conformal_alpha}")
     
@@ -583,44 +781,96 @@ def calibrate_conformal_prediction(
     if len(rollouts) == 0:
         raise ValueError("No rollouts found in calibration dataset. Check calibration_data_path and config settings.")
     
-    # Forward pass on calibration data
+    # Forward pass on calibration data - PROCESS ONE STEP AT A TIME like live inference
+    print("Processing calibration data step-by-step to match live inference behavior...")
+    scores_list = []
+    
     with torch.no_grad():
-        scores, valid_masks, _ = model_forward_dataloader(qnetwork, val_seen_dataloader)
+        for rollout in tqdm(rollouts, desc="Calibrating"):
+            episode_scores = []
+            
+            # Initialize hidden state for this episode
+            num_layers = qnetwork.gru.num_layers
+            hidden_size = qnetwork.gru.hidden_size
+            hidden_state = torch.zeros(num_layers, hidden_size, dtype=torch.float32, device=device)
+            
+            # Process each timestep sequentially
+            T = rollout.top_10_probs.shape[0]  # Sequence length
+            for t in range(T):
+                # Prepare single-step batch (same as live inference)
+                # IMPORTANT: Cast to float32 to match training data dtype
+                batch = {
+
+
+
+
+                    "top_10_probs": rollout.top_10_probs[t:t+1].unsqueeze(0).to(device=device, dtype=torch.float32),  # (1, 1, 7, 10)
+                    "action_vectors": rollout.action_vectors[t:t+1].unsqueeze(0).to(device=device, dtype=torch.float32),  # (1, 1, 7)
+                    "done_masks": torch.ones(1, 1, 1, dtype=torch.float32, device=device),  # (1, 1, 1)
+                }
+                
+                # Compute Q-value using same function as live inference
+                q_value, hidden_state = compute_q_value(
+                    qnetwork,
+                    batch,
+                    hidden_state=hidden_state,
+                    use_categorical=cfg.use_categorical
+                )
+                
+                episode_scores.append(q_value)
+            
+            scores_list.append(np.array(episode_scores))
     
-    scores = scores.detach().cpu().numpy()
-    seq_lengths = valid_masks.sum(dim=-1).cpu().numpy()  # (B,)
+    print(f"Calibration scores computed for {len(scores_list)} episodes")
     
-    print(f"Scores shape: {scores.shape}, Valid sequences: {(seq_lengths > 0).sum()}")
+    # For compatibility with downstream code, create dummy seq_lengths
+    seq_lengths = np.array([len(s) for s in scores_list])
     
-    # Convert to list of sequences
-    scores_by_split = {
-        "val_seen": [
-            scores[i, :int(seq_lengths[i])] for i in range(len(seq_lengths)) if seq_lengths[i] > 0
-        ]
-    }
+    print(f"Calibration scores computed for {len(scores_list)} episodes")
     
-    print(f"Number of score sequences: {len(scores_by_split['val_seen'])}")
+    # For compatibility with downstream code, create dummy seq_lengths
+    seq_lengths = np.array([len(s) for s in scores_list])
     
-    # Get rollouts from dataset
-    rollouts_by_split = {"val_seen": rollouts}
+    print(f"Scores shape: {len(scores_list)} sequences, Valid sequences: {(seq_lengths > 0).sum()}")
     
-    # Compute conformal prediction band
-    # For failure detection, calibrate on failed rollouts to learn failure score distribution
-    cp_band = compute_functional_conformal_band(
-        rollouts=rollouts,
-        scores=scores_by_split["val_seen"],
-        alpha=cfg.conformal_alpha,
-        calib_on="neg",  # Calibration on the successful rollouts
-        align_method="extend"
+    # Filter out invalid sequences
+    valid_indices = [i for i in range(len(seq_lengths)) if seq_lengths[i] > 0]
+    scores_list = [scores_list[i] for i in valid_indices]
+    filtered_rollouts = [rollouts[i] for i in valid_indices]
+    
+    print(f"Number of score sequences: {len(scores_list)}")
+    print(f"Number of filtered rollouts: {len(filtered_rollouts)}")
+    
+    # Build rollouts_by_split_name and scores_by_split_name
+    # Always use filtered_rollouts for val_seen to ensure alignment with scores
+    if rollouts_by_split_name is None:
+        rollouts_by_split_name = {}
+    
+    # Override val_seen with filtered rollouts to match scores
+    rollouts_by_split_name["val_seen"] = filtered_rollouts
+    scores_by_split_name = {"val_seen": scores_list}
+    
+    # If we have test splits in rollouts_by_split_name, we need to compute their scores too
+    # For now, use the same data for both calibration and test if test splits not provided
+    for split_name in test_split_names:
+        if split_name not in rollouts_by_split_name:
+            rollouts_by_split_name[split_name] = filtered_rollouts
+        if split_name not in scores_by_split_name:
+            scores_by_split_name[split_name] = scores_list
+    
+    # Use eval_functional_conformal to get consistent output
+    df, cp_bands_by_alpha = eval_functional_conformal(
+        rollouts_by_split_name, scores_by_split_name, "model",
+        calib_split_names=calib_split_names, test_split_names=test_split_names
     )
+    
+    # Retrieve the CP band for the given alpha
+    cp_band = cp_bands_by_alpha[cfg.conformal_alpha][0]  # Shape: (T,)
     
     print(f"Calibration complete. CP band length: {len(cp_band)}")
     print(f"CP band range: [{cp_band.min():.4f}, {cp_band.max():.4f}]")
     
-    return cp_band
-
-
-
+    return cp_band, df, cp_bands_by_alpha
 
 
 @draccus.wrap()
@@ -631,7 +881,7 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
     assert cfg.qnetwork_checkpoint != "", "Must provide qnetwork_checkpoint"
     
     # Set random seed
-    set_seed_everywhere(cfg.seed)
+    seed_everything(cfg.seed)
     
     # Device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -652,121 +902,51 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
         assert cfg.calibration_data_path != "", "Must provide calibration_data_path for conformal prediction"
         
         # Set seed for reproducible data split
-        seed_everything(20)
-        
-        # Load all rollouts from calibration data path
-        print(f"Loading rollouts from {cfg.calibration_data_path}")
-        all_rollouts = load_rollouts(qnet_cfg)
-        print(f"Loaded {len(all_rollouts)} rollouts")
-        
-        # Split rollouts using the same logic as training
-        rollouts_by_split_name = split_rollouts(qnet_cfg, all_rollouts)
-        
-        # Use calibration tasks (non-test tasks) for computing conformal band
-        # With seed 20: Seen tasks: [7, 1, 8, 5, 0, 2, 6], Unseen tasks: [9, 4, 3], so calibration uses remaining tasks
-        cal_rollouts = rollouts_by_split_name["val_seen"]
-        print(f"Using {len(cal_rollouts)} rollouts for calibration")
-        set_seed_everywhere(cfg.seed)
+        seed_everything(0)
 
-        # Create dataset and dataloader for calibration
-        cal_dataset = RolloutDataset(qnet_cfg, cal_rollouts)
-            
-        cal_dataloader = DataLoader(
-            cal_dataset,
-            batch_size=qnet_cfg.model.batch_size,
-            shuffle=False,
-            num_workers=0
-        )
         
-        # Calibrate conformal prediction
-        # cp_band = calibrate_conformal_prediction(cfg, qnetwork, cal_dataloader, device)
-        cp_band = np.array([0.55364347, 0.6004635, 0.6159687, 0.62208635, 0.63810444, 0.666774,
- 0.6678727, 0.66632473, 0.6751642, 0.6954582, 0.6805216, 0.6960955,
- 0.67814636, 0.6970952, 0.6980845, 0.7020362, 0.688499, 0.72018075,
- 0.70954645, 0.7482432, 0.75311446, 0.7873663, 0.7984467, 0.8379945,
- 0.83655775, 0.85945773, 0.83507466, 0.7962165, 0.7729573, 0.82493544,
- 0.8693599, 0.8757074, 0.8962555, 0.8588753, 0.87694156, 0.85260713,
- 0.87451696, 0.8608254, 0.84997463, 0.83468676, 0.7942938, 0.7781569,
- 0.76962394, 0.74258614, 0.7194412, 0.72303635, 0.6991202, 0.7089902,
- 0.69851017, 0.7503003, 0.74801916, 0.70048565, 0.6893656, 0.66563845,
- 0.6867944, 0.69243574, 0.6738049, 0.68873614, 0.703409, 0.70690817,
- 0.7143407, 0.7245461, 0.73577845, 0.74858296, 0.77545524, 0.7962052,
- 0.7937569, 0.7861711, 0.7636255, 0.77389026, 0.77412254, 0.7474363,
- 0.75227827, 0.74216425, 0.7438587, 0.7442956, 0.7698471, 0.74626076,
- 0.75188804, 0.79475284, 0.8167328, 0.8607359, 0.8684646, 0.8403996,
- 0.8180328, 0.8362357, 0.7834352, 0.82495946, 0.7591102, 0.82022196,
- 0.8262436, 0.8204602, 0.74081486, 0.7590832, 0.74553585, 0.76324475,
- 0.7540931, 0.73856676, 0.732711, 0.7630793, 0.7855823, 0.71375036,
- 0.72253114, 0.6961771, 0.7034679, 0.7497002, 0.76246583, 0.7193041,
- 0.757805, 0.77443606, 0.77857053, 0.7999973, 0.8385123, 0.79455125,
- 0.7956295, 0.7809666, 0.8046513, 0.8627622, 0.8791101, 0.89719117,
- 0.90184563, 0.9205423, 0.92653394, 0.9186658, 0.8984595, 0.9005548,
- 0.8614375, 0.8433602, 0.83899975, 0.8714964, 0.87327117, 0.8631016,
- 0.851225, 0.82007515, 0.8691224, 0.90863246, 0.93648136, 0.9709177,
- 0.9666596, 0.96953106, 0.9606114, 0.8653704, 0.8404896, 0.82211506,
- 0.8029909, 0.8200626, 0.7928973, 0.8376578, 0.838833, 0.84847116,
- 0.85679996, 0.8566748, 0.8307533, 0.82445246, 0.8116056, 0.83702135,
- 0.80206823, 0.80689824, 0.8098441, 0.7985216, 0.8131069, 0.7666719,
- 0.78898907, 0.79012877, 0.7969121, 0.76583105, 0.7664565, 0.7609348,
- 0.7723451, 0.7623124, 0.77744645, 0.75778675, 0.77950794, 0.7411144,
- 0.75552917, 0.77622247, 0.84770006, 0.84346795, 0.822721, 0.82367384,
- 0.8156876, 0.80118424, 0.78774494, 0.78123343, 0.7632961, 0.75235295,
- 0.74925256, 0.757027, 0.76206994, 0.75017214, 0.7684624, 0.7812711,
- 0.81160176, 0.80121815, 0.8035307, 0.8000443, 0.78891647, 0.7827481,
- 0.7873907, 0.78569365, 0.7668251, 0.7691511, 0.74406147, 0.75093436,
- 0.77239823, 0.7807485, 0.7657077, 0.7741063, 0.77754134, 0.797539,
- 0.78871393, 0.77949405, 0.7878001, 0.8008459, 0.80572474, 0.78746104,
- 0.7798719, 0.76405627, 0.7559308, 0.75140357, 0.73519003, 0.7486421,
- 0.75164926, 0.75081336, 0.7629696, 0.7785157, 0.80342627, 0.7757447,
- 0.76918936, 0.772375, 0.76598, 0.79464865, 0.76898736, 0.79249716,
- 0.8507185, 0.8644688, 0.8558607, 0.86905897, 0.8251446, 0.87989783,
- 0.8573288, 0.83905196, 0.85041225, 0.86201835, 0.88624585, 0.90535766,
- 0.92370474, 0.90517527, 0.9242281, 0.8987392, 0.89043236, 0.902496,
- 0.90396357, 0.90806615, 0.9178214, 0.9138459, 0.85460067, 0.8425995,
- 0.8588953, 0.861103, 0.87434906, 0.8851272, 0.8942602, 0.9029039,
- 0.89870167, 0.8925415, 0.89917266, 0.8964132, 0.8886843, 0.8881578,
- 0.89442587, 0.90109986, 0.90462434, 0.9014236, 0.8977362, 0.8961829,
- 0.8947044, 0.9031336, 0.88685346, 0.8858139, 0.88804775, 0.89701617,
- 0.90584224, 0.90386724, 0.89283323, 0.9038564, 0.91690993, 0.93772507,
- 0.9200907, 0.9159785, 0.91567063, 0.9211582, 0.92185485, 0.925532,
- 0.9227066, 0.91854453, 0.93195075, 0.9285706, 0.93884146, 0.9312563,
- 0.92639005, 0.93338037, 0.92841995, 0.92217886, 0.9118788, 0.9205862,
- 0.92100394, 0.91163695, 0.9171977, 0.91367805, 0.91722775, 0.9120263,
- 0.9124695, 0.91138065, 0.90948766, 0.9145549, 0.9061241, 0.9181234,
- 0.92165077, 0.9133975, 0.9024857, 0.9000055, 0.88790894, 0.8917929,
- 0.90367174, 0.91025186, 0.9214711, 0.9227666, 0.9289508, 0.9284035,
- 0.9262128, 0.9254435, 0.91592216, 0.9138979, 0.9100705, 0.902647,
- 0.90590215, 0.8902954, 0.895047, 0.88657403, 0.8861008, 0.88604456,
- 0.88581955, 0.8859794, 0.89226145, 0.88592637, 0.886162, 0.88632566,
- 0.88736, 0.88779664, 0.8882467, 0.88784707, 0.88627017, 0.886645,
- 0.88730013, 0.8877244, 0.88796604, 0.8876474, 0.8866395, 0.8863436,
- 0.88648146, 0.88645566, 0.9021696, 0.88590896, 0.88618475, 0.8864765,
- 0.8866866, 0.8865773, 0.88591814, 0.8868066, 0.8857078, 0.8910154,
- 0.8891918, 0.8856416, 0.8878071, 0.88699734, 0.886914, 0.88638747,
- 0.8863345, 0.8864156, 0.8875673, 0.88844526, 0.8884573, 0.88757676,
- 0.88796234, 0.88795376, 0.8868986, 0.88673437, 0.8861884, 0.8862517,
- 0.8864763, 0.8858677, 0.88569504, 0.88667405, 0.8901619, 0.89031005,
- 0.88861895, 0.89089215, 0.88777554, 0.88626355, 0.8867115, 0.8896719,
- 0.89131004, 0.8915737, 0.8857378, 0.885759, 0.8859913, 0.88636434,
- 0.8873354, 0.88797, 0.8878617, 0.88852096, 0.888052, 0.8878014,
- 0.88926065, 0.8891235, 0.88886446, 0.8885803, 0.88846904, 0.88862467,
- 0.8895038, 0.8899943, 0.889966, 0.8907397, 0.89018357, 0.89037424,
- 0.89095885, 0.89119357, 0.8915783, 0.89226687, 0.8916004, 0.8922335,
- 0.8929839, 0.89373934, 0.8932896, 0.89315146, 0.8927982, 0.89322865,
- 0.8932378, 0.89312524, 0.8941388, 0.8940376, 0.89407927, 0.89471316,
- 0.895571, 0.89523757, 0.89398736, 0.8940102, 0.8935072, 0.8931948,
- 0.89359534, 0.89370835, 0.8935765, 0.89354247, 0.89352894, 0.8931098,
- 0.8939498, 0.893933, 0.8940382, 0.8937826, 0.8924854, 0.892197,
- 0.8919015, 0.8918005, 0.8915957, 0.8924333, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334, 0.89256334,
- 0.89256334, 0.89256334, 0.89256334, 0.89256334])
+
+        
+        # Load or calibrate conformal prediction
+        cp_band_path = f"/home/shellyfra/Projects/SAFE/checkpoints/cp_band_alpha{cfg.conformal_alpha}.npy"
+        if cp_band_path is not None and os.path.exists(cp_band_path):
+            print(f"Loading CP band from {cp_band_path}")
+            cp_band = np.load(cp_band_path)
+            cp_bands_by_alpha = {cfg.conformal_alpha: np.expand_dims(cp_band, axis=0)}
+            df = None
+            print(f"CP band loaded. Length: {len(cp_band)}, Range: [{cp_band.min():.4f}, {cp_band.max():.4f}]")
+        else:
+            print("CP band file not found. Computing from scratch...")
+                    # Load all rollouts from calibration data path
+            print(f"Loading rollouts from {cfg.calibration_data_path}")
+            all_rollouts = load_rollouts(qnet_cfg)
+            print(f"Loaded {len(all_rollouts)} rollouts")
+            
+            # Split rollouts using the same logic as training
+            seed_everything(cfg.calibration_seed)
+            rollouts_by_split_name = split_rollouts(qnet_cfg, all_rollouts)
+            
+            # Use calibration tasks (non-test tasks) for computing conformal band
+            # With seed 20: Seen tasks: [7, 1, 8, 5, 0, 2, 6], Unseen tasks: [9, 4, 3], so calibration uses remaining tasks
+            cal_rollouts = rollouts_by_split_name["val_seen"]
+            print(f"Using {len(cal_rollouts)} rollouts for calibration")
+
+            # Create dataset and dataloader for calibration
+            cal_dataset = RolloutDataset(qnet_cfg, cal_rollouts)
+                
+            cal_dataloader = DataLoader(
+                cal_dataset,
+                batch_size=qnet_cfg.model.batch_size,
+                shuffle=False,
+                num_workers=0
+            )
+            cp_band, df, cp_bands_by_alpha = calibrate_conformal_prediction(
+                cfg, qnetwork, cal_dataloader, device,
+                rollouts_by_split_name=None,  # Let it build from dataloader
+                calib_split_names=["val_seen"],
+                test_split_names=["val_unseen"]
+            )
+
         print(f"Conformal prediction calibrated with alpha={cfg.conformal_alpha}")
     
     # Get LIBERO tasks
@@ -781,15 +961,17 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
     elif cfg.task_start_index is not None and cfg.task_end_index is not None:
         task_ids_to_eval = list(range(cfg.task_start_index, cfg.task_end_index))
     else:
-        # Default: use seed 0 test split (tasks 0, 3, 5 for libero_10)
+        # Default: use seed 4 test split (Seen tasks: [7, 1, 8, 5, 0, 2, 6], Unseen tasks: [9, 4, 3])
         task_ids_to_eval = [4]
     
     print(f"Evaluating on tasks: {task_ids_to_eval}")
     
     # Results storage
     all_results = []
+
     
     # Iterate through tasks
+    seed_everything(cfg.seed)
     for task_id in tqdm(task_ids_to_eval, desc="Evaluating tasks"):
         # Get task
         task = task_suite.get_task(task_id)
@@ -863,7 +1045,7 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
             early_stopped = False
             cp_early_stop = False
             
-            # Initialize hidden state with correct dimensions (num_layers, hidden_size)
+            # Initialize hidden state for GRU - unbatched mode: (num_layers, hidden_size)
             num_layers = qnetwork.gru.num_layers
             hidden_size = qnetwork.gru.hidden_size
             hidden_state = torch.zeros(num_layers, hidden_size, dtype=torch.float32, device=device)
@@ -887,65 +1069,80 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                         ),
                     }
                     
-                    # Get action from OpenVLA
-                    result = get_action(
-                        cfg,
-                        model,
-                        observation,
-                        task_description,
-                        processor=processor,
-                        n_samples=cfg.n_samples,
-                    )
-                    
-                    if type(result) is tuple:
-                        actions, probs, logits, generated_outputs = result
+                    # Use CP-guided action selection if enabled
+                    if cfg.use_cp_guided_selection:
+                        action, q_value, hidden_state, cp_result = cp_guided_action_selection(
+                            cfg=cfg,
+                            model=model,
+                            processor=processor,
+                            observation=observation,
+                            task_description=task_description,
+                            qnetwork=qnetwork,
+                            hidden_state=hidden_state,
+                            device=device,
+                            step_idx=t,
+                            cp_threshold=cp_band[t - cfg.num_steps_wait] if (cfg.use_conformal_prediction and cp_band is not None and (t - cfg.num_steps_wait) >= 0 and (t - cfg.num_steps_wait) < len(cp_band)) else None,
+                            use_categorical=cfg.use_categorical,
+                        )
+                        top_10_probs = cp_result['top_10_probs']
+                        logits = None  # Not used when CP-guided selection is enabled
                     else:
-                        actions = result
-                        generated_outputs = {}
-                    
-                    # Normalize and invert gripper
-                    actions = normalize_gripper_action(actions, binarize=True)
-                    if cfg.model_family == "openvla":
-                        actions = invert_gripper_action(actions)
-                    
-                    action = actions[0] if actions.ndim > 1 else actions
-                    
-                    # Extract token probabilities for Q-network
-                    if isinstance(logits, tuple):
-                        vocab_size = model.config.text_config.vocab_size - model.config.pad_to_multiple_of
-                        n_action_bins = model.config.n_action_bins
+                        # Standard action selection
+                        result = get_action(
+                            cfg,
+                            model,
+                            observation,
+                            task_description,
+                            processor=processor,
+                            n_samples=cfg.n_samples,
+                            do_sample=False,
+                        )
                         
-                        logits_stacked = torch.stack(logits, axis=0)
-                        action_logits = logits_stacked[:, 0, vocab_size - n_action_bins + 1 : vocab_size + 1]
-                        token_probs = F.softmax(action_logits, dim=-1)  # (7, 256)
+                        logits = None
+                        if type(result) is tuple:
+                            actions, probs, logits, generated_outputs = result
+                        else:
+                            actions = result
+                            generated_outputs = {}
                         
-                        # Get top-10 for Q-network
-                        top_10_probs = torch.topk(token_probs, k=10, dim=-1).values  # (7, 10)
-                    else:
-                        # Fallback: create dummy probs
-                        top_10_probs = torch.ones(7, 10, device=device) * 0.1
+                        # Normalize and invert gripper
+                        actions = normalize_gripper_action(actions, binarize=True)
+                        if cfg.model_family == "openvla":
+                            actions = invert_gripper_action(actions)
+                        
+                        action = actions[0] if actions.ndim > 1 else actions
+                        
+                        if isinstance(logits, tuple):
+                            logits_cpu = tuple(l.cpu().numpy() for l in logits)
+                            logits_probs = np.array([softmax(logits_cpu[i]) for i in range(len(logits_cpu))])
+                            probs_dof = logits_probs.squeeze(axis=1)
+                            sorted_probs = np.sort(probs_dof, axis=1)[..., ::-1]
+                            sorted_probs = sorted_probs[:, :10]
+                            top_10_probs = torch.from_numpy(sorted_probs.copy()).to(device=device, dtype=torch.float32)
+                        else:
+                            top_10_probs = torch.ones(7, 10, device=device) * 0.1
+                        
+                        # Prepare Q-network input
+                        qnet_batch = prepare_qnetwork_input(action, top_10_probs, t, device)
+                        
+                        # Compute Q-value
+                        q_value, hidden_state = compute_q_value(
+                            qnetwork,
+                            qnet_batch,
+                            hidden_state=hidden_state,
+                            use_categorical=cfg.use_categorical
+                        )
                     
-                    # Prepare Q-network input
-                    qnet_batch = prepare_qnetwork_input(action, top_10_probs, t, device)
-                    
-                    # Compute Q-value
-                    # q_value, hidden_state = compute_q_value(
-                    #     qnetwork,
-                    #     qnet_batch,
-                    #     hidden_state=hidden_state,
-                    #     use_categorical=cfg.use_categorical
-                    # )
-                    q_value, hidden_state = qnetwork(qnet_batch)
-                    
+                    if t == cfg.num_steps_wait:
+                        print(f"[DEBUG] First Q-value at step {t}: {q_value:.7f}")
+
                     episode_q_values.append(q_value)
                     episode_actions.append(action)
                     
-                    # Store frame for video (convert BGR to RGB)
                     if cfg.save_videos:
-                        frame_bgr = obs["agentview_image"]  # Get raw observation image
+                        frame_bgr = obs["agentview_image"]
                         episode_frames.append(frame_bgr)
                     
-                    # Check conformal prediction threshold if enabled
                     cp_threshold = None
                     cp_violation = False
                     if cfg.use_conformal_prediction and cp_band is not None:
@@ -962,9 +1159,9 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                                 print(f"    WARNING: Conformal prediction violation! Testing 10 sampled actions...")
                                 cp_early_stop = True
                                 early_stopped = True
-                                
-                                # Save current state for resetting during trials
-                                current_state = env.sim.get_state()
+
+                                #  # Save current state for resetting during trials
+                                # current_state = env.sim.get_state()
                                 
                                 # Execute recovery sampling
                                 if isinstance(logits, tuple):
@@ -976,14 +1173,9 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                                         env=env,
                                         task_description=task_description,
                                         resize_size=resize_size,
-                                        vocab_size=vocab_size,
-                                        n_action_bins=n_action_bins,
-                                        device=device,
-                                        num_recovery_steps=20,
-                                        prev_action=action,
-                                        initial_state=current_state
+                                        initial_state=initial_states[episode_idx],
                                     )
-                                    
+                
                                     # Add recovery frames to episode frames
                                     if cfg.save_videos:
                                         episode_frames.extend(recovery_frames)
@@ -996,7 +1188,6 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                                         break
                                     continue
                     
-                    # Display monitoring info
                     if cp_threshold is not None:
                         info_str = f"    Step {t}: Q-value = {q_value:.4f}"
                         info_str += f" (CP threshold: {cp_threshold:.4f})"
@@ -1046,7 +1237,7 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
             task_results["cp_violations"].append(episode_cp_violations)
             
             # Save video with Q-values and CP bands
-            if cfg.save_videos and len(episode_frames) > 0:
+            if cfg.save_videos and len(episode_frames) > 0: # and not (final_success and not cp_early_stop)
                 save_video_with_scores(
                     frames=episode_frames,
                     scores=episode_failure_scores if episode_failure_scores else episode_q_values,

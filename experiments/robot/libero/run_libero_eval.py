@@ -22,8 +22,10 @@ from tqdm import tqdm, trange
 from scipy.special import softmax
 
 import pandas as pd
-sys.path.append("/home/shellyfra/Projects/SAFE/openvla")
-sys.path.append("/home/shellyfra/Projects/SAFE/openvla/LIBERO")
+script_dir = Path(__file__).parent
+openvla_root = script_dir.parent.parent.parent
+sys.path.append(str(openvla_root))
+sys.path.append(str(openvla_root / "LIBERO"))
 from libero.libero import benchmark
 
 
@@ -76,6 +78,7 @@ class GenerateConfig:
     output_logits: bool = True                       # Whether to output logits from the model
     output_attentions: bool = False                  # Whether to output attention weights from the model
     output_hidden_states: bool = False               # Whether to output hidden states from the model
+    nora_num_steps: int = 10                         # Number of Nora action steps to sample
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -95,7 +98,7 @@ class GenerateConfig:
 
     use_wandb: bool = True                           # Whether to also log results in Weights & Biases
     wandb_project: str = "openvla"                   # Name of W&B project to log to (use default!)
-    wandb_entity: str = "shellyfra"                  # Name of entity to log under
+    wandb_entity: str = "anonymous"                  # Name of entity to log under
     wandb_dir: Optional[str] = None                  # Directory to save W&B logs
     save_logs: bool = True                          # Whether to dump W&B logs to a file
 
