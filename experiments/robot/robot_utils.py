@@ -11,6 +11,10 @@ from experiments.robot.openvla_utils import (
     get_vla,
     get_vla_action,
 )
+# from experiments.robot.nora_utils import (
+#     get_nora,
+#     get_nora_action,
+# )
 
 # Initialize important constants and pretty-printing mode in NumPy.
 ACTION_DIM = 7
@@ -42,6 +46,8 @@ def get_model(cfg, wrap_diffusion_policy_for_droid=False):
     """Load model for evaluation."""
     if cfg.model_family == "openvla":
         model = get_vla(cfg)
+    # elif cfg.model_family == "nora":
+    #     model = get_nora(cfg)
     else:
         raise ValueError("Unexpected `model_family` found in config.")
     print(f"Loaded model: {type(model)}")
@@ -56,19 +62,29 @@ def get_image_resize_size(cfg):
     """
     if cfg.model_family == "openvla":
         resize_size = 224
+    # elif cfg.model_family == "nora":
+    #     resize_size = 224
     else:
         raise ValueError("Unexpected `model_family` found in config.")
     return resize_size
 
 
-def get_action(cfg, model, obs, task_label, processor=None, n_samples: int = 1):
+def get_action(cfg, model, obs, task_label, processor=None, n_samples: int = 1, do_sample=False, temperature: float = 1.0):
     """Queries the model to get an action."""
     if cfg.model_family == "openvla":
         action = get_vla_action(
             model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop, n_samples=n_samples, 
-            output_attentions=cfg.output_attentions, output_hidden_states=cfg.output_hidden_states, output_logits=cfg.output_logits
+            output_attentions=cfg.output_attentions, output_hidden_states=cfg.output_hidden_states, output_logits=cfg.output_logits,
+            do_sample=do_sample, temperature=temperature,
         )
         # assert action.shape == (ACTION_DIM,)
+    # elif cfg.model_family == "nora":
+    #     action = get_nora_action(
+    #         model,
+    #         obs,
+    #         task_label,
+    #         num_steps=getattr(cfg, "nora_num_steps", 10),
+    #     )
     else:
         raise ValueError("Unexpected `model_family` found in config.")
     return action

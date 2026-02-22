@@ -199,7 +199,7 @@ def get_text_tokens(processor, task_label, base_vla_name):
 def get_vla_action(
     vla, processor, base_vla_name, obs, task_label, unnorm_key, 
     center_crop=False, n_samples: int = 1, output_attentions: bool = False,
-    output_hidden_states: bool = False, output_logits: bool = False
+    output_hidden_states: bool = False, output_logits: bool = False, do_sample=False, temperature: float = 1.0
 ):
     """Generates an action with the VLA policy."""
     image = preprocess_image(obs["full_image"], center_crop)
@@ -211,9 +211,12 @@ def get_vla_action(
     if n_samples == 1:
         # Get a single action.
         kwargs = {"do_sample": False}
+    elif do_sample:
+        # Sample 1 action
+        kwargs = {"do_sample": True, "use_cache": False, "num_return_sequences": n_samples, "temperature": temperature}
     else:
         # Sample multiple actions. 
-        kwargs = {"do_sample": True, "use_cache": False, "num_return_sequences": n_samples}
+        kwargs = {"do_sample": True, "use_cache": False, "num_return_sequences": n_samples, "temperature": temperature}
 
     kwargs['return_dict_in_generate'] = True
     kwargs['output_logits'] = output_logits

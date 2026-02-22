@@ -5,8 +5,14 @@ Runs OpenVLA in LIBERO with live GRUQNetwork evaluation at each step.
 Computes Q-values and checks conformal prediction thresholds in real-time.
 """
 
-from collections import defaultdict
+# CRITICAL: Set rendering backend BEFORE any other imports
 import os
+os.environ['MUJOCO_GL'] = 'egl'
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+# Disable display requirement for headless rendering
+os.environ['EGL_DEVICE_ID'] = '0'
+
+from collections import defaultdict
 import pickle
 import sys
 from dataclasses import dataclass, asdict
@@ -15,6 +21,7 @@ from typing import Any, Literal, Optional, Union, Tuple, List
 import torch
 import torch.nn.functional as F
 import wandb
+import json
 
 import draccus
 import numpy as np
@@ -63,7 +70,7 @@ from experiments.robot.unc_utils import (
 )
 
 # Import Q-Network
-from failure_prob.model.q_learning import GRUQNetwork, CategoricalGRUQNetwork
+from failure_prob.model.q_learning import GRUQNetwork
 from failure_prob.conf import Config as OpenvlaDatasetConfig
 from failure_prob.utils.metrics import compute_functional_conformal_band, eval_functional_conformal
 from failure_prob.utils.routines import model_forward_dataloader
@@ -96,7 +103,7 @@ class GenerateConfig:
     output_hidden_states: bool = False               # Whether to output hidden states from the model
     
     temperature: float = 1.5                         # Temperature for action sampling in CP-guided selection
-    n_action_candidates: int = 5                    # Number of action candidates to sample for CP-guided selection
+    n_action_candidates: int = 10                    # Number of action candidates to sample for CP-guided selection
     use_cp_guided_selection: bool = True             # Whether to use CP-guided action selection
 
     #################################################################################################################
@@ -105,7 +112,6 @@ class GenerateConfig:
     qnetwork_checkpoint: str = "./checkpoints/model_final_TDQC_OpenVLA_LIBERO10.ckpt"  # Path to trained Q-network checkpoint
     qnetwork_config_path: str = "./checkpoints/config_TDQC_OpenVLA_LIBERO10.yaml"      # Path to Q-network config file
     conformal_threshold: float = 0.5                 # Conformal prediction threshold for stopping
-    use_categorical: bool = False                    # Whether to use categorical Q-network
     
     #################################################################################################################
     # Conformal Prediction parameters
@@ -157,10 +163,7 @@ def load_qnetwork(cfg: GenerateConfig, device: torch.device):
     input_dim = qnet_cfg.dataset.dim_features
     
     # Create model
-    if cfg.use_categorical or (hasattr(qnet_cfg.model, 'use_categorical') and qnet_cfg.model.use_categorical):
-        qnetwork = CategoricalGRUQNetwork(qnet_cfg, input_dim)
-    else:
-        qnetwork = GRUQNetwork(qnet_cfg, input_dim)
+    qnetwork = GRUQNetwork(qnet_cfg, input_dim)
     
     # Load checkpoint
     checkpoint = torch.load(cfg.qnetwork_checkpoint, map_location=device)
@@ -217,7 +220,6 @@ def compute_q_value(
     qnetwork,
     batch: dict,
     hidden_state: Optional[torch.Tensor] = None,
-    use_categorical: bool = False, 
 ) -> tuple[float, torch.Tensor]:
     """
     Compute Q-value for current step using manual GRU processing.
@@ -227,7 +229,6 @@ def compute_q_value(
         qnetwork: Q-network model
         batch: Input batch with single timestep (B=1, T=1)
         hidden_state: Hidden state from previous step (num_layers, hidden_size)
-        use_categorical: Whether using categorical Q-network
         
     Returns:
         (q_value, new_hidden_state)
@@ -280,6 +281,171 @@ def compute_q_value(
         
     return q_val_scalar, new_hidden_state
 
+def _get_all_object_positions(obs: dict) -> dict:
+    """Extract all non-robot object positions from observation."""
+    exclude_keys = {'robot0_eef_pos', 'robot0_eef_quat', 'robot0_gripper_qpos', 
+                    'robot0_joint_pos', 'agentview_image', 'robot0_eye_in_hand_image'}
+    
+    object_positions = {}
+    for key, value in obs.items():
+        if key.endswith('_pos') and key not in exclude_keys:
+            if isinstance(value, np.ndarray) and value.shape == (3,):
+                object_positions[key.replace('_pos', '')] = value
+    
+    return object_positions
+
+
+def _compute_task_4_metrics(obs: dict) -> dict:
+    """Task 4 (libero_10): Put white mug on left plate and yellow-white mug on right plate."""
+    # Plates (targets)
+    plate_1_pos = obs['plate_1_pos']
+    plate_2_pos = obs['plate_2_pos']
+    
+    # Goal: mugs should be at plate positions (+ small height offset)
+    goal_positions = {
+        'porcelain_mug_1': plate_1_pos + np.array([0, 0, 0.02]),      # White mug on left plate
+        'white_yellow_mug_1': plate_2_pos + np.array([0, 0, 0.02]),   # Yellow-white mug on right plate
+    }
+    
+    # Current mug positions
+    current_positions = {
+        'porcelain_mug_1': obs['porcelain_mug_1_pos'],
+        'white_yellow_mug_1': obs['white_yellow_mug_1_pos'],
+    }
+    
+    return goal_positions, current_positions
+
+
+def _compute_task_3_metrics(obs: dict) -> dict:
+    """Task 3 (libero_10): Put black bowl in bottom drawer and close it."""
+    # Get drawer position - the drawer is part of white_cabinet_1
+    # When drawer is open, we need to check if bowl is inside
+    drawer_pos = obs.get('white_cabinet_1_bottom_region_pos', obs.get('white_cabinet_1_pos', np.array([0, 0, 0])))
+    
+    # Goal: black bowl should be in the drawer region (with some tolerance for inside)
+    goal_positions = {
+        'akita_black_bowl_1': drawer_pos + np.array([0, 0, 0.05]),  # Inside drawer, slight height offset
+    }
+    
+    # Current bowl position
+    current_positions = {
+        'akita_black_bowl_1': obs['akita_black_bowl_1_pos'],
+    }
+    
+    return goal_positions, current_positions
+
+
+def _compute_task_9_metrics(obs: dict) -> dict:
+    """Task 9 (libero_10): Put yellow and white mug in microwave and close it."""
+    # Get microwave position
+    microwave_pos = obs.get('microwave_1_pos', obs.get('microwave_pos', np.array([0, 0, 0])))
+    
+    # Goal: both white mug and yellow-white mug should be inside the microwave
+    goal_positions = {
+        'porcelain_mug_1': microwave_pos + np.array([0, 0, 0.05]),      # White mug in microwave
+        'white_yellow_mug_1': microwave_pos + np.array([0, 0, 0.05]),   # Yellow-white mug in microwave
+    }
+    
+    # Current mug positions
+    current_positions = {
+        'porcelain_mug_1': obs['porcelain_mug_1_pos'],
+        'white_yellow_mug_1': obs['white_yellow_mug_1_pos'],
+    }
+    
+    return goal_positions, current_positions
+
+
+def _compute_generic_metrics(obs: dict) -> dict:
+    """Generic fallback: just record all object positions without goal inference."""
+    object_positions = _get_all_object_positions(obs)
+    
+    # No goal positions - just track current positions
+    return {}, object_positions
+
+
+def compute_and_save_final_distances(
+    obs: dict,
+    task_id: int,
+    episode_idx: int,
+    save_root: str,
+    task_description: str = ""
+) -> dict:
+    """
+    Compute final object-to-goal distances and save metrics when episode is done.
+    Versatile function that handles different task types.
+    
+    Args:
+        obs: Final observation dictionary
+        task_id: Task ID
+        episode_idx: Episode index
+        save_root: Root directory to save results
+        task_description: Optional task description for context
+        
+    Returns:
+        Dictionary with distance metrics
+    """
+    # Task-specific handlers (for libero_10 suite)
+    task_handlers = {
+        3: _compute_task_3_metrics,  # Black bowl in drawer
+        4: _compute_task_4_metrics,  # Mugs on plates
+        9: _compute_task_9_metrics,  # Yellow-white mug in microwave
+        # Add more tasks as needed
+    }
+    
+    # Get goal and current positions using task-specific handler
+    if task_id in task_handlers:
+        goal_positions, current_positions = task_handlers[task_id](obs)
+        has_goal_positions = len(goal_positions) > 0
+    else:
+        print(f"  No specific handler for task {task_id}, using generic position tracking")
+        goal_positions, current_positions = _compute_generic_metrics(obs)
+        has_goal_positions = False
+    
+    # Compute distances if we have goal positions
+    distances = {}
+    if has_goal_positions:
+        for obj_name in goal_positions:
+            if obj_name in current_positions:
+                distance = np.linalg.norm(current_positions[obj_name] - goal_positions[obj_name])
+                distances[obj_name] = float(distance)
+                # print(f"  {obj_name}: {distance:.3f}m from goal")
+    
+    # Compute summary metrics
+    if distances:
+        avg_distance = np.mean(list(distances.values()))
+        max_distance = np.max(list(distances.values()))
+        objects_at_goal = sum(1 for d in distances.values() if d < 0.03)  # Within 3cm
+    else:
+        avg_distance = None
+        max_distance = None
+        objects_at_goal = None
+    
+    # Create metrics dictionary
+    metrics = {
+        'task_id': task_id,
+        'episode_idx': episode_idx,
+        'task_description': task_description,
+        'distances': distances,
+        'avg_distance': float(avg_distance) if avg_distance is not None else None,
+        'max_distance': float(max_distance) if max_distance is not None else None,
+        'objects_at_goal': objects_at_goal,
+        'total_objects': len(goal_positions) if has_goal_positions else len(current_positions),
+        'current_positions': {k: v.tolist() for k, v in current_positions.items()},
+    }
+    
+    # Only include goal_positions if we have them
+    if has_goal_positions:
+        metrics['goal_positions'] = {k: v.tolist() for k, v in goal_positions.items()}
+    
+    # Save to JSON file
+    os.makedirs(save_root, exist_ok=True)
+    metrics_file = os.path.join(save_root, f"task{task_id}_ep{episode_idx}_final_distances.json")
+    
+    with open(metrics_file, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    # print(f"  Saved distance metrics to {metrics_file}")
+    return metrics
 
 def cp_guided_action_selection(
     cfg: GenerateConfig,
@@ -292,7 +458,6 @@ def cp_guided_action_selection(
     device: torch.device,
     step_idx: int,
     cp_threshold: Optional[float] = None,
-    use_categorical: bool = False,
     env = None,
     resize_size: tuple = None,
 ) -> Tuple[np.ndarray, float, torch.Tensor, dict]:
@@ -310,7 +475,6 @@ def cp_guided_action_selection(
         device: Device
         step_idx: Current step index
         cp_threshold: Optional CP threshold for filtering
-        use_categorical: Whether using categorical Q-network
         
     Returns:
         (selected_action, q_value, updated_hidden_state, result_dict)
@@ -342,7 +506,7 @@ def cp_guided_action_selection(
     
     # Get unique actions to reduce redundant evaluations
     unique_actions = np.unique(actions, axis=0)
-    print(f"        Evaluating {len(unique_actions)} unique actions out of {len(actions)} samples")
+    # print(f"        Evaluating {len(unique_actions)} unique actions out of {len(actions)} samples")
     
     # Save current environment state for rollouts
     if env is not None:
@@ -459,7 +623,6 @@ def cp_guided_action_selection(
             qnetwork,
             qnet_batch,
             hidden_state=hidden_state.clone() if hidden_state is not None else None,
-            use_categorical=use_categorical
         )
         
         q_values.append(q_value)
@@ -509,7 +672,7 @@ def cp_guided_action_selection(
         'n_unique_actions': len(unique_actions),
     }
     
-    print(f"        CP-guided selection with 1-step lookahead: Q-values range [{min(q_values):.4f}, {max(q_values):.4f}], selected #{safest_idx}/{len(unique_actions)} with Q={selected_q_value:.4f}")
+    print(f"step {step_idx}   CP-guided selection with 1-step lookahead: Q-values range [{min(q_values):.4f}, {max(q_values):.4f}], selected #{safest_idx}/{len(unique_actions)} with Q={selected_q_value:.4f}")
     
     return selected_action, selected_q_value, selected_hidden_state, result_dict
 
@@ -814,7 +977,6 @@ def calibrate_conformal_prediction(
                     qnetwork,
                     batch,
                     hidden_state=hidden_state,
-                    use_categorical=cfg.use_categorical
                 )
                 
                 episode_scores.append(q_value)
@@ -897,55 +1059,50 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
     
     # Load calibration data and compute conformal prediction threshold
     cp_band = None
-    if cfg.use_conformal_prediction:
-        print("\nLoading calibration data for conformal prediction...")
-        assert cfg.calibration_data_path != "", "Must provide calibration_data_path for conformal prediction"
+    print("\nLoading calibration data for conformal prediction...")
+    assert cfg.calibration_data_path != "", "Must provide calibration_data_path for conformal prediction"
+    
+    # Set seed for reproducible data split
+    seed_everything(0)
+    # Load or calibrate conformal prediction
+    cp_band_path = f"./checkpoints/cp_band_alpha{cfg.conformal_alpha}.npy"
+    if cp_band_path is not None and os.path.exists(cp_band_path):
+        print(f"Loading CP band from {cp_band_path}")
+        cp_band = np.load(cp_band_path)
+        cp_bands_by_alpha = {cfg.conformal_alpha: np.expand_dims(cp_band, axis=0)}
+        df = None
+        print(f"CP band loaded. Length: {len(cp_band)}, Range: [{cp_band.min():.4f}, {cp_band.max():.4f}]")
+    else:
+        print("CP band file not found. Computing from scratch...")
+                # Load all rollouts from calibration data path
+        print(f"Loading rollouts from {cfg.calibration_data_path}")
+        all_rollouts = load_rollouts(qnet_cfg)
+        print(f"Loaded {len(all_rollouts)} rollouts")
         
-        # Set seed for reproducible data split
-        seed_everything(0)
+        # Split rollouts using the same logic as training
+        seed_everything(cfg.calibration_seed)
+        rollouts_by_split_name = split_rollouts(qnet_cfg, all_rollouts)
+        
+        # Use calibration tasks (non-test tasks) for computing conformal band
+        # With seed 20: Seen tasks: [7, 1, 8, 5, 0, 2, 6], Unseen tasks: [9, 4, 3], so calibration uses remaining tasks
+        cal_rollouts = rollouts_by_split_name["val_seen"]
+        print(f"Using {len(cal_rollouts)} rollouts for calibration")
 
-        
-
-        
-        # Load or calibrate conformal prediction
-        cp_band_path = f"/home/shellyfra/Projects/SAFE/checkpoints/cp_band_alpha{cfg.conformal_alpha}.npy"
-        if cp_band_path is not None and os.path.exists(cp_band_path):
-            print(f"Loading CP band from {cp_band_path}")
-            cp_band = np.load(cp_band_path)
-            cp_bands_by_alpha = {cfg.conformal_alpha: np.expand_dims(cp_band, axis=0)}
-            df = None
-            print(f"CP band loaded. Length: {len(cp_band)}, Range: [{cp_band.min():.4f}, {cp_band.max():.4f}]")
-        else:
-            print("CP band file not found. Computing from scratch...")
-                    # Load all rollouts from calibration data path
-            print(f"Loading rollouts from {cfg.calibration_data_path}")
-            all_rollouts = load_rollouts(qnet_cfg)
-            print(f"Loaded {len(all_rollouts)} rollouts")
+        # Create dataset and dataloader for calibration
+        cal_dataset = RolloutDataset(qnet_cfg, cal_rollouts)
             
-            # Split rollouts using the same logic as training
-            seed_everything(cfg.calibration_seed)
-            rollouts_by_split_name = split_rollouts(qnet_cfg, all_rollouts)
-            
-            # Use calibration tasks (non-test tasks) for computing conformal band
-            # With seed 20: Seen tasks: [7, 1, 8, 5, 0, 2, 6], Unseen tasks: [9, 4, 3], so calibration uses remaining tasks
-            cal_rollouts = rollouts_by_split_name["val_seen"]
-            print(f"Using {len(cal_rollouts)} rollouts for calibration")
-
-            # Create dataset and dataloader for calibration
-            cal_dataset = RolloutDataset(qnet_cfg, cal_rollouts)
-                
-            cal_dataloader = DataLoader(
-                cal_dataset,
-                batch_size=qnet_cfg.model.batch_size,
-                shuffle=False,
-                num_workers=0
-            )
-            cp_band, df, cp_bands_by_alpha = calibrate_conformal_prediction(
-                cfg, qnetwork, cal_dataloader, device,
-                rollouts_by_split_name=None,  # Let it build from dataloader
-                calib_split_names=["val_seen"],
-                test_split_names=["val_unseen"]
-            )
+        cal_dataloader = DataLoader(
+            cal_dataset,
+            batch_size=qnet_cfg.model.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+        cp_band, df, cp_bands_by_alpha = calibrate_conformal_prediction(
+            cfg, qnetwork, cal_dataloader, device,
+            rollouts_by_split_name=None,  # Let it build from dataloader
+            calib_split_names=["val_seen"],
+            test_split_names=["val_unseen"]
+        )
 
         print(f"Conformal prediction calibrated with alpha={cfg.conformal_alpha}")
     
@@ -962,7 +1119,7 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
         task_ids_to_eval = list(range(cfg.task_start_index, cfg.task_end_index))
     else:
         # Default: use seed 4 test split (Seen tasks: [7, 1, 8, 5, 0, 2, 6], Unseen tasks: [9, 4, 3])
-        task_ids_to_eval = [4]
+        task_ids_to_eval = [3, 9]
     
     print(f"Evaluating on tasks: {task_ids_to_eval}")
     
@@ -1082,7 +1239,6 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                             device=device,
                             step_idx=t,
                             cp_threshold=cp_band[t - cfg.num_steps_wait] if (cfg.use_conformal_prediction and cp_band is not None and (t - cfg.num_steps_wait) >= 0 and (t - cfg.num_steps_wait) < len(cp_band)) else None,
-                            use_categorical=cfg.use_categorical,
                         )
                         top_10_probs = cp_result['top_10_probs']
                         logits = None  # Not used when CP-guided selection is enabled
@@ -1130,7 +1286,6 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                             qnetwork,
                             qnet_batch,
                             hidden_state=hidden_state,
-                            use_categorical=cfg.use_categorical
                         )
                     
                     if t == cfg.num_steps_wait:
@@ -1225,6 +1380,14 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                     traceback.print_exc()
                     break
             
+            # Compute and save final distance metrics
+            distance_metrics = compute_and_save_final_distances(
+                obs=obs,
+                task_id=task_id,
+                episode_idx=episode_idx,
+                save_root=cfg.save_root,
+                task_description=task_description
+            )
             # Record results
             final_success = reward > 0 if t > cfg.num_steps_wait else False
             task_results["successes"].append(final_success)
