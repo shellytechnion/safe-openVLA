@@ -78,7 +78,6 @@ class GenerateConfig:
     output_logits: bool = True                       # Whether to output logits from the model
     output_attentions: bool = False                  # Whether to output attention weights from the model
     output_hidden_states: bool = False               # Whether to output hidden states from the model
-    nora_num_steps: int = 10                         # Number of Nora action steps to sample
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -136,6 +135,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
         assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
+    elif cfg.model_family == "nora":
+        # [NORA] LIBERO finetuned models were trained with LeRobot MIN_MAX normalization
+        # + invert_grippler_action=True. The FAST tokenizer preserves the training range,
+        # so we unnormalize using MIN_MAX stats from the LeRobot datasets (lerobot/*_image).
+        # These are embedded in the Nora class and selected by unnorm_key=task_suite_name.
+        assert cfg.task_suite_name in ("libero_10", "libero_object", "libero_spatial", "libero_goal", "libero_90"), (
+            f"No NORA normalization stats for task suite '{cfg.task_suite_name}'. "
+            f"Available: libero_10, libero_object, libero_spatial, libero_goal, libero_90"
+        )
+        print(f"Using NORA MIN_MAX unnormalization stats for {cfg.task_suite_name}")
 
     # [OpenVLA] Get Hugging Face processor
     processor = None
@@ -188,7 +197,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
-
+        if cfg.model_family == "nora":
+            env, task_description = get_libero_env(task, "openvla", resolution=256)
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in trange(start_episode, cfg.num_trials_per_task):
@@ -278,6 +288,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         actions, probs, logits, generated_outputs = actions
                         
                     else:
+                        probs = None
+                        logits = None
                         generated_outputs = {} # empty dict
                         
                     if cfg.output_hidden_states:
@@ -301,6 +313,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
                     if cfg.model_family == "openvla":
                         actions = invert_gripper_action(actions)
+                    elif cfg.model_family == "nora":
+                        # NORA was trained with invert_grippler_action=True, which maps gripper
+                        # from LIBERO [-1=open,+1=close] to NORA [0=close,1=open].
+                        # After MIN_MAX unnorm, gripper is in [0,1]. normalize_gripper above maps
+                        # it to [-1,+1]. We invert to flip back to LIBERO convention:
+                        # NORA open(1)->norm(+1)->invert(-1) = LIBERO open
+                        # NORA close(0)->norm(-1)->invert(+1) = LIBERO close
+                        actions = invert_gripper_action(actions)
+                        actions[..., -1] = np.where(actions[..., -1] >= 0.0, 1.0, actions[..., -1])
+                        actions = actions.squeeze(0)
                         
                     to_be_logged = {
                         "action/timestep": t,
@@ -317,7 +339,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         action = actions[0]
 
                     else: # single-forward uncertainty metrics
-                        metrics = compute_token_uncertainty_metrics(generated_outputs, model)
+                        if cfg.model_family == "openvla":
+                            metrics = compute_token_uncertainty_metrics(generated_outputs, model)
+                        else:
+                            metrics = {}  # NORA doesn't support OpenVLA-style token uncertainty
                         
                         # Log the metrics
                         for k, v in metrics.items():
@@ -330,15 +355,18 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     action_episode.append(action)
                     probs_episode.append(probs)
                     if isinstance(logits, tuple):
-                        vocab_size = model.config.text_config.vocab_size - model.config.pad_to_multiple_of
-                        n_action_bins = model.config.n_action_bins
-                        
-                        # For PROBS: slice to action bins and apply softmax (matches CSV computation)
-                        # Use bfloat16 for softmax to match data collection precision
-                        logits = torch.stack(logits, axis=0)
-                        action_logits = logits[:, 0, vocab_size - n_action_bins + 1 : vocab_size + 1]  # (7, 256)
-                        token_prob = F.softmax(action_logits, dim=-1)  # (7, 256) - keep in bfloat16
-                        # probs = token_prob.max(dim=-1).values.float().cpu().numpy()  # (7,)
+                        if cfg.model_family == "openvla":
+                            vocab_size = model.config.text_config.vocab_size - model.config.pad_to_multiple_of
+                            n_action_bins = model.config.n_action_bins
+                            
+                            # For PROBS: slice to action bins and apply softmax (matches CSV computation)
+                            logits = torch.stack(logits, axis=0)
+                            action_logits = logits[:, 0, vocab_size - n_action_bins + 1 : vocab_size + 1]  # (7, 256)
+                            token_prob = F.softmax(action_logits, dim=-1)  # (7, 256)
+                        elif cfg.model_family == "nora":
+                            # NORA: logits_tuple already contains only action-token logits
+                            action_logits = torch.stack(list(logits), dim=0)  # (num_action_tokens, vocab_size)
+                            token_prob = F.softmax(action_logits, dim=-1)
 
                     #     logits_cpu = tuple(l.cpu().numpy() for l in logits)
                     # logits_probs = np.array([softmax(logits_cpu[i]) for i in range(len(logits_cpu))])
@@ -436,14 +464,43 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             # Save the hidden states
             if cfg.output_hidden_states:
-                hidden_states_episode = torch.stack(hidden_states_episode, dim=0) # (T, 7, 4096)
-                hidden_states_episode = hidden_states_episode
-                probs_episode = np.stack(probs_episode) # (T, 7)
-                probs_episode = probs_episode
+                if cfg.model_family == "nora":
+                    # NORA generates variable-length token sequences per step;
+                    # pad to the max length so we can stack into a regular tensor
+                    max_tokens_hs = max(h.shape[0] for h in hidden_states_episode)
+                    hidden_dim = hidden_states_episode[0].shape[1]
+                    padded_hs = []
+                    for h in hidden_states_episode:
+                        pad_size = max_tokens_hs - h.shape[0]
+                        if pad_size > 0:
+                            h = torch.cat([h, torch.zeros(pad_size, hidden_dim)], dim=0)
+                        padded_hs.append(h)
+                    hidden_states_episode = torch.stack(padded_hs, dim=0)
+
+                    max_tokens_p = max(p.shape[0] for p in probs_episode)
+                    padded_probs = []
+                    for p in probs_episode:
+                        pad_size = max_tokens_p - p.shape[0]
+                        if pad_size > 0:
+                            p = np.concatenate([p, np.zeros(pad_size)])
+                        padded_probs.append(p)
+                    probs_episode = np.stack(padded_probs)
+
+                    max_tokens_l = max(l.shape[0] for l in logits_episode)
+                    top_k = logits_episode[0].shape[1]
+                    padded_logits = []
+                    for l in logits_episode:
+                        pad_size = max_tokens_l - l.shape[0]
+                        if pad_size > 0:
+                            l = np.concatenate([l, np.zeros((pad_size, top_k))], axis=0)
+                        padded_logits.append(l)
+                    logits_episode = np.stack(padded_logits)
+                else:
+                    hidden_states_episode = torch.stack(hidden_states_episode, dim=0) # (T, 7, 4096)
+                    probs_episode = np.stack(probs_episode) # (T, 7)
+                    logits_episode = np.stack(logits_episode) # (T, 7, 10)
+
                 action_episode = np.stack(action_episode) # (T, action_dim)
-                action_episode = action_episode
-                logits_episode = np.stack(logits_episode) # (T, 32,000 approx)
-                logits_episode = logits_episode
                 hidden_states_path = mp4_path.with_suffix(".pkl")
                 save_dict = {
                     "hidden_states": hidden_states_episode,

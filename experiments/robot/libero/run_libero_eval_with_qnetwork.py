@@ -67,6 +67,7 @@ from experiments.robot.viz_utils import (
 from experiments.robot.unc_utils import (
     compute_token_uncertainty_metrics,
     compute_samples_uncertainty_metrics,
+    logits2entropy,
 )
 
 # Import Q-Network
@@ -104,7 +105,8 @@ class GenerateConfig:
     
     temperature: float = 1.5                         # Temperature for action sampling in CP-guided selection
     n_action_candidates: int = 10                    # Number of action candidates to sample for CP-guided selection
-    use_cp_guided_selection: bool = True             # Whether to use CP-guided action selection
+    use_cp_guided_selection: bool = False             # Whether to use CP-guided action selection
+    use_entropy_guided_selection: bool = False       # Whether to use entropy-guided action selection (pick lowest mean_token_entropy)
 
     #################################################################################################################
     # Q-Network specific parameters
@@ -318,13 +320,13 @@ def _compute_task_4_metrics(obs: dict) -> dict:
 
 def _compute_task_3_metrics(obs: dict) -> dict:
     """Task 3 (libero_10): Put black bowl in bottom drawer and close it."""
-    # Get drawer position - the drawer is part of white_cabinet_1
-    # When drawer is open, we need to check if bowl is inside
-    drawer_pos = obs.get('white_cabinet_1_bottom_region_pos', obs.get('white_cabinet_1_pos', np.array([0, 0, 0])))
+    # The bottom drawer is part of white_cabinet_1
+    # Goal position based on observed successful completions
+    drawer_pos = np.array([-0.0075, 0.2888, 0.9242])
     
-    # Goal: black bowl should be in the drawer region (with some tolerance for inside)
+    # Goal: black bowl should be in the drawer region  
     goal_positions = {
-        'akita_black_bowl_1': drawer_pos + np.array([0, 0, 0.05]),  # Inside drawer, slight height offset
+        'akita_black_bowl_1': drawer_pos,  # Inside drawer at successful position
     }
     
     # Current bowl position
@@ -675,6 +677,117 @@ def cp_guided_action_selection(
     print(f"step {step_idx}   CP-guided selection with 1-step lookahead: Q-values range [{min(q_values):.4f}, {max(q_values):.4f}], selected #{safest_idx}/{len(unique_actions)} with Q={selected_q_value:.4f}")
     
     return selected_action, selected_q_value, selected_hidden_state, result_dict
+
+
+def entropy_guided_action_selection(
+    cfg: GenerateConfig,
+    model,
+    processor,
+    observation: dict,
+    task_description: str,
+    device: torch.device,
+    step_idx: int,
+) -> Tuple[np.ndarray, float, dict]:
+    """
+    Sample multiple actions and select the most confident one (lowest mean_token_entropy).
+    
+    Args:
+        cfg: Configuration
+        model: OpenVLA model
+        processor: Processor for observations
+        observation: Current observation dict
+        task_description: Task description string
+        device: Device
+        step_idx: Current step index
+        
+    Returns:
+        (selected_action, selected_entropy, result_dict)
+    """
+    n_candidates = cfg.n_action_candidates
+    
+    # Sample multiple actions with temperature
+    result = get_action(
+        cfg,
+        model,
+        observation,
+        task_description,
+        processor=processor,
+        n_samples=n_candidates,
+        do_sample=True,
+        temperature=cfg.temperature,
+    )
+    
+    if type(result) is tuple:
+        actions, probs, logits, generated_outputs = result
+    else:
+        actions = result
+        logits = None
+        generated_outputs = {}
+    
+    # Normalize actions
+    actions = normalize_gripper_action(actions, binarize=True)
+    if cfg.model_family == "openvla":
+        actions = invert_gripper_action(actions)
+    
+    # Compute mean_token_entropy for each candidate action
+    entropies = []
+    if generated_outputs is not None and (isinstance(generated_outputs.logits, (list, tuple))):
+        vocab_size = model.config.text_config.vocab_size - model.config.pad_to_multiple_of
+        n_action_bins = model.config.n_action_bins
+        
+        for i in range(len(actions)):
+            # Gather per-DOF logits for candidate i and compute entropy
+            logits = generated_outputs.logits  # Tuple of (n_dof, batch_size, vocab_size)
+            candidate_logits = []
+            for dof in range(len(logits)):
+                logits_dof = logits[dof][i:i+1]  # (1, vocab_size)
+                candidate_logits.append(logits_dof)
+            candidate_logits = torch.cat(candidate_logits, dim=0)  # (n_dof, vocab_size)
+            
+            # Slice to action bins only
+            candidate_logits = candidate_logits[:, vocab_size - n_action_bins + 1 : vocab_size + 1]  # (n_dof, n_bins)
+            
+            # Replace -inf with a large negative finite value to avoid nan in entropy
+            candidate_logits = candidate_logits.clamp(min=-1e9)
+            
+            # Compute entropy per token and take mean
+            entr = logits2entropy(candidate_logits)  # (n_dof,)
+            mean_entropy = entr.mean().item()
+            entropies.append(mean_entropy)
+    else:
+        # Fallback: assign equal entropy to all candidates
+        entropies = [0.0] * len(actions)
+    
+    # Select action with lowest mean_token_entropy (most confident)
+    best_idx = int(np.argmin(entropies))
+    selected_action = actions[best_idx] if actions.ndim > 1 else actions
+    selected_entropy = entropies[best_idx]
+    
+    # Build top_10_probs for the selected action (for Q-network compatibility)
+    if logits is not None and isinstance(logits, (list, tuple)):
+        selected_top_10_probs_list = []
+        for dof in range(len(logits)):
+            logits_dof = logits[dof][best_idx].cpu().numpy()  # (vocab_size,)
+            probs_dof = softmax(logits_dof)  # (vocab_size,)
+            top_10_indices = np.argsort(probs_dof)[::-1][:10]
+            top_10_probs_dof = probs_dof[top_10_indices]  # (10,)
+            selected_top_10_probs_list.append(top_10_probs_dof)
+        selected_top_10_probs = np.array(selected_top_10_probs_list)
+        selected_top_10_probs = torch.from_numpy(selected_top_10_probs.copy()).to(device=device, dtype=torch.float32)
+    else:
+        selected_top_10_probs = torch.ones(7, 10, device=device) * 0.1
+    
+    result_dict = {
+        'top_10_probs': selected_top_10_probs,
+        'all_entropies': entropies,
+        'best_idx': best_idx,
+        'entropy_range': (min(entropies), max(entropies)),
+        'n_candidates': len(actions),
+    }
+    
+    print(f"step {step_idx}   Entropy-guided selection: entropies range [{min(entropies):.4f}, {max(entropies):.4f}], selected #{best_idx}/{len(actions)} with entropy={selected_entropy:.4f}")
+    
+    return selected_action, selected_entropy, result_dict
 
 
 def recovery_sampling(
@@ -1227,7 +1340,20 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                     }
                     
                     # Use CP-guided action selection if enabled
-                    if cfg.use_cp_guided_selection:
+                    if cfg.use_entropy_guided_selection:
+                        action, selected_entropy, entropy_result = entropy_guided_action_selection(
+                            cfg=cfg,
+                            model=model,
+                            processor=processor,
+                            observation=observation,
+                            task_description=task_description,
+                            device=device,
+                            step_idx=t,
+                        )
+                        top_10_probs = entropy_result['top_10_probs']
+                        logits = None  # Not used when entropy-guided selection is enabled
+                        q_value = selected_entropy
+                    elif cfg.use_cp_guided_selection:
                         action, q_value, hidden_state, cp_result = cp_guided_action_selection(
                             cfg=cfg,
                             model=model,

@@ -6,6 +6,7 @@ Runs Nora-1.5 in a LIBERO simulation environment.
 
 import pickle
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,7 @@ from experiments.robot.robot_utils import (
     normalize_gripper_action,
     set_seed_everywhere,
 )
+from experiments.robot.viz_utils import PoseCumulator
 
 
 @dataclass
@@ -66,7 +68,6 @@ class GenerateConfig:
     run_id_note: Optional[str] = "nora"
     save_root: str = "./rollouts_nora"
     save_logs: bool = True
-    save_hidden_states: bool = False
     use_wandb: bool = False
     wandb_project: str = "nora-libero"
     wandb_entity: str = "anonymous"
@@ -161,11 +162,16 @@ def eval_libero_nora(cfg: GenerateConfig) -> None:
             else:
                 raise ValueError(f"Unsupported task suite: {cfg.task_suite_name}")
 
+            logs = defaultdict(list)
+            logs_cum = defaultdict(float)
+            pose_cumulator = PoseCumulator()
             logs_to_dump = []
             action_episode = []
+            probs_episode = []
+            logits_episode = []
+            hidden_states_episode = []
             done = False
             reward = 0.0
-            hidden_states_episode = []
 
             while t < max_steps + cfg.num_steps_wait:
                 if t < cfg.num_steps_wait:
@@ -176,7 +182,25 @@ def eval_libero_nora(cfg: GenerateConfig) -> None:
                 img = get_libero_image(obs, resize_size)
                 observation = _build_observation(obs, img)
                 pil_image = Image.fromarray(observation["full_image"]).convert("RGB")
-                action = _select_action(model.sample_actions(pil_image, task_description, num_steps=cfg.nora_num_steps))
+                raw_output = model.sample_actions(
+                    pil_image, task_description,
+                    num_steps=cfg.nora_num_steps,
+                    return_hidden_states=True,
+                )
+                raw_action, extra_outputs = raw_output
+                action = _select_action(raw_action)
+
+                # Collect VLM hidden states (last token of last layer)
+                if extra_outputs["hidden_states"] is not None:
+                    hidden_states_episode.append(extra_outputs["hidden_states"][-1, :])  # (hidden_dim,)
+
+                # Collect VLM logits (last token)
+                if extra_outputs["logits"] is not None:
+                    logits_episode.append(extra_outputs["logits"][-1, :].numpy())  # (vocab_size,)
+
+                # Collect velocity norms as proxy for "probs" (denoising confidence)
+                # velocity_norms shape: (num_steps, action_chunk_length)
+                probs_episode.append(extra_outputs["velocity_norms"])
 
                 if cfg.clip_actions:
                     action = np.clip(action, -cfg.action_clip_value, cfg.action_clip_value)
@@ -184,6 +208,15 @@ def eval_libero_nora(cfg: GenerateConfig) -> None:
                     action = normalize_gripper_action(action, binarize=True)
                 if cfg.invert_gripper:
                     action = invert_gripper_action(action)
+
+                # Compute action norms
+                dpos = float(np.linalg.norm(action[:3]))
+                drot = float(np.linalg.norm(action[3:6]))
+                logs_cum["dpos"] += dpos
+                logs_cum["drot"] += drot
+
+                # Track end-effector pose
+                pose_cumulator.update(obs["robot0_eef_pos"], obs["robot0_eef_quat"])
 
                 to_be_logged = {
                     "action/timestep": t,
@@ -194,7 +227,19 @@ def eval_libero_nora(cfg: GenerateConfig) -> None:
                     "action/dpitch": float(action[4]),
                     "action/dyaw": float(action[5]),
                     "action/dgripper": float(action[6]),
+                    "action/dpos": dpos,
+                    "action/drot": drot,
+                    "action/cum_dpos": logs_cum["dpos"],
+                    "action/cum_drot": logs_cum["drot"],
+                    "pose/cum_pos": pose_cumulator.cum_pos,
+                    "pose/cum_rot": pose_cumulator.cum_rot,
                 }
+
+                # Convert numpy values to float
+                for k, v in to_be_logged.items():
+                    if isinstance(v, np.floating):
+                        to_be_logged[k] = float(v)
+
                 logs_to_dump.append(to_be_logged)
                 if cfg.use_wandb:
                     wandb.log(to_be_logged)
@@ -218,20 +263,22 @@ def eval_libero_nora(cfg: GenerateConfig) -> None:
             mp4_path = save_folder / f"task{task_id}--ep{episode_idx}--succ{int(done)}.mp4"
             save_rollout_video_given_path(replay_images, mp4_path)
 
-            if cfg.save_hidden_states:
-                save_dict = {
-                    "hidden_states": torch.stack(hidden_states_episode, dim=0) if hidden_states_episode else torch.zeros((0, 1)),
-                    "action": np.stack(action_episode) if action_episode else np.zeros((0, 7), dtype=np.float32),
-                    "probs": None,
-                    "logits": None,
-                    "task_suite_name": cfg.task_suite_name,
-                    "task_id": task_id,
-                    "task_description": task_description,
-                    "episode_idx": episode_idx,
-                    "episode_success": int(done),
-                    "mp4_path": str(mp4_path),
-                }
-                pickle.dump(save_dict, open(mp4_path.with_suffix(".pkl"), "wb"))
+            # Always save episode data as pkl
+            save_dict = {
+                "hidden_states": torch.stack(hidden_states_episode, dim=0) if hidden_states_episode else torch.zeros((0, 1)),  # (T, hidden_dim)
+                "action": np.stack(action_episode) if action_episode else np.zeros((0, 7), dtype=np.float32),  # (T, 7)
+                "probs": np.stack(probs_episode) if probs_episode else None,  # (T, num_steps, action_chunk_length) — velocity norms
+                "logits": np.stack(logits_episode) if logits_episode else None,  # (T, vocab_size) — VLM logits at last token
+                "task_suite_name": cfg.task_suite_name,
+                "task_id": task_id,
+                "task_description": task_description,
+                "eposide_idx": episode_idx,
+                "episode_success": done,
+                "mp4_path": str(mp4_path),
+            }
+            pkl_path = mp4_path.with_suffix(".pkl")
+            pickle.dump(save_dict, open(pkl_path, "wb"))
+            print(f"Saved episode data at {pkl_path}")
 
             if cfg.save_logs:
                 pd.DataFrame(logs_to_dump).to_csv(mp4_path.with_suffix(".csv"), index=False)

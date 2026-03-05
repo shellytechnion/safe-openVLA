@@ -33,31 +33,47 @@ def get_libero_dummy_action(model_family: str):
     return [0, 0, 0, 0, 0, 0, -1]
 
 
-def resize_image(img, resize_size):
+def resize_image(img, resize_size, use_jpeg=True):
     """
     Takes numpy array corresponding to a single image and returns resized image as numpy array.
 
     NOTE (Moo Jin): To make input images in distribution with respect to the inputs seen at training time, we follow
                     the same resizing scheme used in the Octo dataloader, which OpenVLA uses for training.
+    
+    Args:
+        img: numpy array of shape (H, W, 3)
+        resize_size: tuple (H, W)
+        use_jpeg: If True, apply JPEG encode/decode (OpenVLA/RLDS pipeline).
+                  If False, skip JPEG (LeRobot pipeline, e.g. NORA).
     """
     assert isinstance(resize_size, tuple)
     # Resize to image size expected by model
-    img = tf.image.encode_jpeg(img)  # Encode as JPEG, as done in RLDS dataset builder
-    img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)  # Immediately decode back
+    if use_jpeg:
+        img = tf.image.encode_jpeg(img)  # Encode as JPEG, as done in RLDS dataset builder
+        img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)  # Immediately decode back
+    else:
+        img = tf.constant(img)
     img = tf.image.resize(img, resize_size, method="lanczos3", antialias=True)
     img = tf.cast(tf.clip_by_value(tf.round(img), 0, 255), tf.uint8)
     img = img.numpy()
     return img
 
 
-def get_libero_image(obs, resize_size):
-    """Extracts image from observations and preprocesses it."""
+def get_libero_image(obs, resize_size, model_family="openvla"):
+    """Extracts image from observations and preprocesses it.
+    
+    Args:
+        obs: observation dict from LIBERO env
+        resize_size: int or tuple target size
+        model_family: "openvla" uses JPEG encode/decode, "nora" skips it
+    """
     assert isinstance(resize_size, int) or isinstance(resize_size, tuple)
     if isinstance(resize_size, int):
         resize_size = (resize_size, resize_size)
     img = obs["agentview_image"]
     img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
-    img = resize_image(img, resize_size)
+    use_jpeg = (model_family != "nora")  # NORA trained with LeRobot (clean images, no JPEG artifacts)
+    img = resize_image(img, resize_size, use_jpeg=use_jpeg)
     return img
 
 
