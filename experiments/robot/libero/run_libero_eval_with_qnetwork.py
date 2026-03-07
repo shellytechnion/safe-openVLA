@@ -5,15 +5,18 @@ Runs OpenVLA in LIBERO with live GRUQNetwork evaluation at each step.
 Computes Q-values and checks conformal prediction thresholds in real-time.
 """
 
-# CRITICAL: Set rendering backend BEFORE any other imports
+# CRITICAL: Set rendering backend and determinism env vars BEFORE any other imports
 import os
 os.environ['MUJOCO_GL'] = 'egl'
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 # Disable display requirement for headless rendering
 os.environ['EGL_DEVICE_ID'] = '0'
+# Force deterministic behaviour in TensorFlow and cuBLAS (must be set before importing TF/torch)
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 from collections import defaultdict
-import pickle
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -81,6 +84,12 @@ from failure_prob.utils.random import seed_everything
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 
+# Force TensorFlow to CPU-only so that tf.image ops (used in resize_image and
+# preprocess_image) are deterministic.  TF's GPU kernels for image ops use
+# non-deterministic atomics.
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')
+
 
 @dataclass
 class GenerateConfig:
@@ -98,7 +107,7 @@ class GenerateConfig:
     unnorm_key: Optional[str] = None                 # Unnormalization key for the model
     
     n_samples: int = 1                               # Number of samples to draw from the model for each action step
-    attn_implementation: str = "flash_attention_2"   # Only eager attention supports return_attentions
+    attn_implementation: str = "flash_attention_2"   # Flash Attention 2 forward pass is always deterministic; only backward is non-deterministic.
     output_logits: bool = True                       # Whether to output logits from the model
     output_attentions: bool = False                  # Whether to output attention weights from the model
     output_hidden_states: bool = False               # Whether to output hidden states from the model
@@ -107,6 +116,7 @@ class GenerateConfig:
     n_action_candidates: int = 10                    # Number of action candidates to sample for CP-guided selection
     use_cp_guided_selection: bool = False             # Whether to use CP-guided action selection
     use_entropy_guided_selection: bool = False       # Whether to use entropy-guided action selection (pick lowest mean_token_entropy)
+    q_value_thresh: float = -np.inf
 
     #################################################################################################################
     # Q-Network specific parameters
@@ -1148,6 +1158,21 @@ def calibrate_conformal_prediction(
     return cp_band, df, cp_bands_by_alpha
 
 
+def _json_serializer(obj):
+    """JSON serializer for numpy and pathlib objects."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 @draccus.wrap()
 def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
     """Main evaluation loop with Q-network and optional conformal prediction."""
@@ -1232,7 +1257,7 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
         task_ids_to_eval = list(range(cfg.task_start_index, cfg.task_end_index))
     else:
         # Default: use seed 4 test split (Seen tasks: [7, 1, 8, 5, 0, 2, 6], Unseen tasks: [9, 4, 3])
-        task_ids_to_eval = [3, 9]
+        task_ids_to_eval = [3, 4, 9]
     
     print(f"Evaluating on tasks: {task_ids_to_eval}")
     
@@ -1264,6 +1289,8 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
             "task_name": task_name,
             "successes": [],
             "q_values": [],
+            "q_steps_above_thresh": [],
+            "q_steps_below_thresh": [],
             "early_stops": [],
             "episode_lengths": [],
             "failure_scores": [],  # Conformal prediction scores
@@ -1274,6 +1301,12 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
         
         # Run episodes
         for episode_idx in range(min(cfg.num_trials_per_task, len(initial_states))):
+            # Re-seed with a deterministic per-episode seed to ensure reproducibility.
+            # This guarantees identical random state at the start of each episode,
+            # regardless of any random state consumed during env.reset() or model loading.
+            episode_seed = cfg.seed + task_id * 1000 + episode_idx
+            seed_everything(episode_seed)
+            
             print(f"\n  Episode {episode_idx + 1}/{cfg.num_trials_per_task}")
             
             # Initialize W&B
@@ -1314,18 +1347,22 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
             episode_frames = []  # Store RGB frames for video
             early_stopped = False
             cp_early_stop = False
+            q_steps_above_thresh = 0
+            q_steps_below_thresh = 0
             
             # Initialize hidden state for GRU - unbatched mode: (num_layers, hidden_size)
             num_layers = qnetwork.gru.num_layers
             hidden_size = qnetwork.gru.hidden_size
             hidden_state = torch.zeros(num_layers, hidden_size, dtype=torch.float32, device=device)
-            
+            q_value = 0
+
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # Wait for objects to stabilize
                     if t < cfg.num_steps_wait:
                         obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
                         t += 1
+                        q_value = 0
                         continue
                     
                     # Get image
@@ -1340,7 +1377,7 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                     }
                     
                     # Use CP-guided action selection if enabled
-                    if cfg.use_entropy_guided_selection:
+                    if cfg.use_entropy_guided_selection and q_value > cfg.q_value_thresh:
                         action, selected_entropy, entropy_result = entropy_guided_action_selection(
                             cfg=cfg,
                             model=model,
@@ -1353,7 +1390,7 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                         top_10_probs = entropy_result['top_10_probs']
                         logits = None  # Not used when entropy-guided selection is enabled
                         q_value = selected_entropy
-                    elif cfg.use_cp_guided_selection:
+                    elif cfg.use_cp_guided_selection and q_value > cfg.q_value_thresh:
                         action, q_value, hidden_state, cp_result = cp_guided_action_selection(
                             cfg=cfg,
                             model=model,
@@ -1393,7 +1430,8 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                             actions = invert_gripper_action(actions)
                         
                         action = actions[0] if actions.ndim > 1 else actions
-                        
+                        # print("action = ", action)
+
                         if isinstance(logits, tuple):
                             logits_cpu = tuple(l.cpu().numpy() for l in logits)
                             logits_probs = np.array([softmax(logits_cpu[i]) for i in range(len(logits_cpu))])
@@ -1416,6 +1454,13 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                     
                     if t == cfg.num_steps_wait:
                         print(f"[DEBUG] First Q-value at step {t}: {q_value:.7f}")
+                    else:
+                        print(f"Q value at step {t}: {q_value:.7f}")
+
+                    if q_value > cfg.q_value_thresh:
+                        q_steps_above_thresh += 1
+                    elif q_value < cfg.q_value_thresh:
+                        q_steps_below_thresh += 1
 
                     episode_q_values.append(q_value)
                     episode_actions.append(action)
@@ -1518,19 +1563,32 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
             final_success = reward > 0 if t > cfg.num_steps_wait else False
             task_results["successes"].append(final_success)
             task_results["q_values"].append(episode_q_values)
+            task_results["q_steps_above_thresh"].append(q_steps_above_thresh)
+            task_results["q_steps_below_thresh"].append(q_steps_below_thresh)
             task_results["early_stops"].append(early_stopped)
             task_results["cp_early_stops"].append(cp_early_stop)
             task_results["episode_lengths"].append(t)
             task_results["failure_scores"].append(episode_failure_scores)
             task_results["cp_thresholds"].append(episode_cp_thresholds)
             task_results["cp_violations"].append(episode_cp_violations)
+
+            print(
+                f"  Q-threshold counts (> {cfg.q_value_thresh:.4f}: {q_steps_above_thresh}, "
+                f"< {cfg.q_value_thresh:.4f}: {q_steps_below_thresh})"
+            )
             
             # Save video with Q-values and CP bands
             if cfg.save_videos and len(episode_frames) > 0: # and not (final_success and not cp_early_stop)
+                video_scores = episode_failure_scores if episode_failure_scores else episode_q_values
+                video_cp_band = (
+                    np.full(len(video_scores), cfg.q_value_thresh, dtype=float)
+                    if cfg.q_value_thresh > -np.inf
+                    else cp_band
+                )
                 save_video_with_scores(
                     frames=episode_frames,
-                    scores=episode_failure_scores if episode_failure_scores else episode_q_values,
-                    cp_band=cp_band,
+                    scores=video_scores,
+                    cp_band=video_cp_band,
                     task_id=task_id,
                     task_description=task_description,
                     episode_idx=episode_idx,
@@ -1547,6 +1605,8 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
                     "early_stopped": early_stopped,
                     "mean_q_value": np.mean(episode_q_values) if episode_q_values else 0.0,
                     "max_q_value": np.max(episode_q_values) if episode_q_values else 0.0,
+                    "q_steps_above_thresh": q_steps_above_thresh,
+                    "q_steps_below_thresh": q_steps_below_thresh,
                 }
                 if cfg.use_conformal_prediction:
                     log_dict.update({
@@ -1561,6 +1621,10 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
         success_rate = np.mean(task_results["successes"])
         early_stop_rate = np.mean(task_results["early_stops"])
         avg_length = np.mean(task_results["episode_lengths"])
+        total_q_steps_above = sum(task_results["q_steps_above_thresh"])
+        total_q_steps_below = sum(task_results["q_steps_below_thresh"])
+        avg_q_steps_above = np.mean(task_results["q_steps_above_thresh"])
+        avg_q_steps_below = np.mean(task_results["q_steps_below_thresh"])
         
         # Calculate stopped and succeeded/failed
         stopped_and_succeeded = sum(1 for i, s in enumerate(task_results["successes"]) if task_results["cp_early_stops"][i] and s)
@@ -1570,6 +1634,8 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
         print(f"  Success Rate: {success_rate:.2%}")
         print(f"  Early Stop Rate (Q-value): {early_stop_rate:.2%}")
         print(f"  Avg Episode Length: {avg_length:.1f}")
+        print(f"  Q-value > {cfg.q_value_thresh:.4f}: total {total_q_steps_above}, avg/ep {avg_q_steps_above:.1f}")
+        print(f"  Q-value < {cfg.q_value_thresh:.4f}: total {total_q_steps_below}, avg/ep {avg_q_steps_below:.1f}")
         
         if cfg.use_conformal_prediction:
             cp_early_stop_rate = np.mean(task_results["cp_early_stops"])
@@ -1587,15 +1653,17 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
         env.close()
     
     # Save results
-    results_path = os.path.join(cfg.save_root, f"qnetwork_results_{cfg.run_id_note}.pkl")
+    results_path = os.path.join(cfg.save_root, f"qnetwork_results_{cfg.run_id_note}.json")
     os.makedirs(cfg.save_root, exist_ok=True)
-    with open(results_path, 'wb') as f:
-        pickle.dump(all_results, f)
+    with open(results_path, 'w') as f:
+        json.dump(all_results, f, indent=2, default=_json_serializer)
     print(f"\nResults saved to: {results_path}")
     
     # Overall summary
     all_successes = [s for task in all_results for s in task["successes"]]
     all_early_stops = [e for task in all_results for e in task["early_stops"]]
+    all_q_steps_above = [count for task in all_results for count in task["q_steps_above_thresh"]]
+    all_q_steps_below = [count for task in all_results for count in task["q_steps_below_thresh"]]
     
     print(f"\n{'='*60}")
     print(f"OVERALL RESULTS")
@@ -1603,6 +1671,8 @@ def eval_libero_with_qnetwork(cfg: GenerateConfig) -> None:
     print(f"Success Rate: {np.mean(all_successes):.2%}")
     print(f"Q-value Early Stop Rate: {np.mean(all_early_stops):.2%}")
     print(f"Total Episodes: {len(all_successes)}")
+    print(f"Q-value > {cfg.q_value_thresh:.4f}: total {sum(all_q_steps_above)}, avg/ep {np.mean(all_q_steps_above):.1f}")
+    print(f"Q-value < {cfg.q_value_thresh:.4f}: total {sum(all_q_steps_below)}, avg/ep {np.mean(all_q_steps_below):.1f}")
     
     if cfg.use_conformal_prediction:
         all_cp_early_stops = [e for task in all_results for e in task["cp_early_stops"]]

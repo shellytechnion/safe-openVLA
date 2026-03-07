@@ -154,26 +154,20 @@ def preprocess_image(original_image: np.ndarray, center_crop: bool) -> Image.Ima
     # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
     #            the original height and width by sqrt(0.9) -- not 0.9!
     if center_crop:
-        batch_size = 1
+        import math
         crop_scale = 0.9
+        W, H = image.size  # PIL uses (width, height)
+        sqrt_scale = math.sqrt(crop_scale)
 
-        # Convert to TF Tensor and record original data type (should be tf.uint8)
-        image = tf.convert_to_tensor(np.array(image))
-        orig_dtype = image.dtype
+        # Compute crop dimensions (matches the TF crop_and_resize logic)
+        new_h = sqrt_scale * H
+        new_w = sqrt_scale * W
+        top = (H - new_h) / 2.0
+        left = (W - new_w) / 2.0
 
-        # Convert to data type tf.float32 and values between [0,1]
-        image = tf.image.convert_image_dtype(image, tf.float32)
-
-        # Crop and then resize back to original size
-        image = crop_and_resize(image, crop_scale, batch_size)
-
-        # Convert back to original data type
-        image = tf.clip_by_value(image, 0, 1)
-        image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
-
-        # Convert back to PIL Image
-        image = Image.fromarray(image.numpy())
-        image = image.convert("RGB")
+        # Use PIL crop (fractional coords are fine) and bilinear resize — fully deterministic
+        image = image.crop((left, top, left + new_w, top + new_h))
+        image = image.resize((W, H), Image.BILINEAR)
     
     return image
 
