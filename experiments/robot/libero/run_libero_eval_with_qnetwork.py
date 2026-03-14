@@ -868,6 +868,7 @@ def recovery_sampling(
             processor=processor,
             n_samples=1,
             do_sample=False,
+            temperature=cfg.temperature, # 1.0 by default
         )
         if type(result) is tuple:
             action = result[0][0] if result[0].ndim > 1 else result[0]
